@@ -13,7 +13,7 @@ import { memoize } from './cache';
 import { convertToCurrency } from './currency';
 import sequelize, { Op } from './sequelize';
 import { amountsRequireTaxForm } from './tax-forms';
-import { computeDatesAsISOStrings, ifStr } from './utils';
+import { ifStr } from './utils';
 
 const twoHoursInSeconds = 2 * 60 * 60;
 const models = sequelize.models;
@@ -102,7 +102,10 @@ const getTotalAnnualBudgetForHost = HostCollectiveId => {
       `
   WITH
     "collectiveids" AS (
-      SELECT id FROM "Collectives" WHERE "HostCollectiveId"=:HostCollectiveId AND "isActive"=true
+      SELECT id FROM "Collectives"
+      WHERE "HostCollectiveId" = :HostCollectiveId
+      AND "isActive"=true
+      AND "deletedAt" IS NULL
     ),
     "monthlyOrdersWithAmountInHostCurrency" AS (
       SELECT o.id, MAX(o."CollectiveId") as "CollectiveId", MAX(t.currency) AS currency, MAX(t."amountInHostCurrency") as "amountInHostCurrency"
@@ -111,7 +114,9 @@ const getTotalAnnualBudgetForHost = HostCollectiveId => {
       LEFT JOIN "Transactions" t ON t."OrderId" = o.id
       WHERE s.interval = 'month' AND s."isActive" = true
         AND o."CollectiveId" IN (SELECT id FROM collectiveids)
+        AND o."deletedAt" IS NULL
         AND s."deletedAt" IS NULL
+        AND t."deletedAt" IS NULL
       GROUP BY o.id
     ),
     "yearlyAndOneTimeOrdersWithAmountInHostCurrency" AS (
@@ -121,8 +126,10 @@ const getTotalAnnualBudgetForHost = HostCollectiveId => {
       LEFT JOIN "Transactions" t ON t."OrderId" = o.id
       WHERE ((s.interval = 'year' AND s."isActive" = true) OR s.interval IS NULL)
         AND o."CollectiveId" IN (SELECT id FROM collectiveids)
+        AND o."deletedAt" IS NULL
         AND s."deletedAt" IS NULL
         AND t."createdAt" > (current_date - INTERVAL '12 months')
+        AND t."deletedAt" IS NULL
       GROUP BY o.id
     )
 
@@ -138,7 +145,10 @@ const getTotalAnnualBudgetForHost = HostCollectiveId => {
       WHERE t.type='CREDIT' AND t."CollectiveId" IN (SELECT id FROM collectiveids)
         AND t."deletedAt" IS NULL
         AND t."createdAt" > (current_date - INTERVAL '12 months')
-        AND s.interval = 'month' AND s."isActive" IS FALSE AND s."deletedAt" IS NULL)
+        AND s.interval = 'month' AND s."isActive" IS FALSE AND s."deletedAt" IS NULL
+        AND t."deletedAt" IS NULL
+        AND o."deletedAt" IS NULL
+    )
     "yearlyIncome"
   `,
       {
@@ -1115,46 +1125,6 @@ const getTaxFormsRequiredForAccounts = async (accountIds = [], year) => {
   return getTaxFormsOverTheLimit(results, 'collectiveId');
 };
 
-/**
- * Returns the contribution or expense amounts over time.
- * @deprecated now using a query in `server/lib/host-metrics.js`
- */
-const getTransactionsTimeSeries = async (
-  kind,
-  type,
-  hostCollectiveId,
-  timeUnit,
-  collectiveIds,
-  startDate = null,
-  endDate = null,
-) => {
-  return sequelize.query(
-    `SELECT DATE_TRUNC(:timeUnit, "createdAt") AS "date", sum("amountInHostCurrency") as "amount", "hostCurrency" as "currency"
-       FROM "Transactions"
-       WHERE kind = :kind
-         AND "HostCollectiveId" = :hostCollectiveId
-         AND type = :type
-         AND "deletedAt" IS NULL
-         ${ifStr(collectiveIds, `AND "CollectiveId" IN (:collectiveIds)`)}
-         ${ifStr(startDate, `AND "createdAt" >= :startDate`)}
-         ${ifStr(endDate, `AND "createdAt" <= :endDate`)}
-       GROUP BY DATE_TRUNC(:timeUnit, "createdAt"), "hostCurrency"
-       ORDER BY DATE_TRUNC(:timeUnit, "createdAt")
-      `,
-    {
-      type: sequelize.QueryTypes.SELECT,
-      replacements: {
-        kind,
-        type,
-        hostCollectiveId,
-        timeUnit,
-        collectiveIds,
-        ...computeDatesAsISOStrings(startDate, endDate),
-      },
-    },
-  );
-};
-
 const serializeCollectivesResult = JSON.stringify;
 
 const unserializeCollectivesResult = string => {
@@ -1198,7 +1168,6 @@ const queries = {
   getTotalNumberOfDonors,
   getUniqueCollectiveTags,
   getGiftCardBatchesForCollective,
-  getTransactionsTimeSeries,
 };
 
 export default queries;

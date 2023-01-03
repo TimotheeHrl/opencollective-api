@@ -8,13 +8,13 @@ import activities from '../constants/activities';
 import { types as CollectiveTypes } from '../constants/collectives';
 import { MODERATION_CATEGORIES } from '../constants/moderation-categories';
 import { VAT_OPTIONS } from '../constants/vat';
-import models, { Op } from '../models';
+import models, { Op, sequelize } from '../models';
 
 import logger from './logger';
 import { stripHTML } from './sanitize-html';
 import { md5 } from './utils';
 
-const { EVENT, PROJECT, USER } = CollectiveTypes;
+const { USER } = CollectiveTypes;
 
 type AvatarUrlOpts = {
   height?: boolean;
@@ -205,6 +205,7 @@ export const collectiveSlugReservedList = [
   'events',
   'expense',
   'expenses',
+  'submitted-expenses',
   'faq',
   'fund',
   'gift-card',
@@ -290,63 +291,80 @@ export async function isCollectiveDeletable(collective) {
 
   let user;
   if (collective.type === USER) {
-    user = await models.User.findOne({ where: { CollectiveId: collective.id } });
+    const { isLastAdminOfAnyCollective } = await sequelize.query(
+      `
+      SELECT EXISTS (
+        SELECT 1
+        FROM "Members" m
+        INNER JOIN "Collectives" c ON m."CollectiveId" = c.id
+        -- Try to find another admins for the same collective
+        LEFT OUTER JOIN "Members" other_members
+          ON m."CollectiveId" = other_members."CollectiveId"
+          AND other_members.role = 'ADMIN'
+          AND other_members."MemberCollectiveId" != m."MemberCollectiveId"
+          AND other_members."deletedAt" IS NULL
+        WHERE m.role = 'ADMIN'
+        AND m."MemberCollectiveId" = :CollectiveId
+        AND m."deletedAt" IS NULL
+        AND c."deletedAt" IS NULL
+        AND other_members.id IS NULL
+      ) AS "isLastAdminOfAnyCollective"
+    `,
+      { plain: true, replacements: { CollectiveId: collective.id } },
+    );
 
-    const adminMemberships = await models.Member.findAll({
-      where: { MemberCollectiveId: collective.id, role: 'ADMIN' },
-      include: [{ model: models.Collective, as: 'collective', required: true }],
-    });
-    if (adminMemberships.length >= 1) {
-      for (const adminMembership of adminMemberships) {
-        if (adminMembership.collective) {
-          const admins = await adminMembership.collective.getAdmins();
-          if (admins.length === 1) {
-            return false;
-          }
-        }
-      }
+    if (isLastAdminOfAnyCollective) {
+      return false;
     }
+
+    user = await models.User.findOne({ where: { CollectiveId: collective.id } });
   }
 
-  const transactionCount = await models.Transaction.count({
-    where: {
-      [Op.or]: [{ CollectiveId: collective.id }, { FromCollectiveId: collective.id }],
+  const { hasUndeletableData } = await sequelize.query(
+    `
+    SELECT (
+      -- Children
+      EXISTS (
+        SELECT 1 FROM "Collectives"
+        WHERE "ParentCollectiveId" = :CollectiveId
+        AND "deletedAt" IS NULL
+      )
+      -- Expenses
+      OR EXISTS (SELECT 1 FROM "Expenses" WHERE "CollectiveId" = :CollectiveId AND "deletedAt" IS NULL)
+      OR EXISTS (SELECT 1 FROM "Expenses" WHERE "FromCollectiveId" = :CollectiveId AND "deletedAt" IS NULL)
+      ${user ? `OR EXISTS (SELECT 1 FROM "Expenses" WHERE "UserId" = :UserId AND "deletedAt" IS NULL) ` : ''}
+      -- Orders
+      OR EXISTS (
+        SELECT 1 FROM "Orders"
+        WHERE ("CollectiveId" = :CollectiveId OR "FromCollectiveId" = :CollectiveId)
+        AND "deletedAt" IS NULL
+        AND status IN ('PAID', 'ACTIVE', 'CANCELLED')
+      )
+      -- Transactions
+      OR EXISTS (
+        SELECT 1 FROM "Transactions"
+        WHERE "CollectiveId" = :CollectiveId
+        AND "deletedAt" IS NULL
+      )
+      OR EXISTS (
+        SELECT 1 FROM "Transactions"
+        WHERE "FromCollectiveId" = :CollectiveId
+        AND "deletedAt" IS NULL
+      )
+      OR EXISTS (
+        SELECT 1 FROM "Transactions"
+        WHERE "HostCollectiveId" = :CollectiveId
+        AND "deletedAt" IS NULL
+      )
+    ) AS "hasUndeletableData"
+  `,
+    {
+      plain: true,
+      replacements: { CollectiveId: collective.id, UserId: user?.id },
     },
-  });
+  );
 
-  const orderCount = await models.Order.count({
-    where: {
-      [Op.or]: [{ CollectiveId: collective.id }, { FromCollectiveId: collective.id }],
-      status: ['PAID', 'ACTIVE', 'CANCELLED'],
-    },
-  });
-
-  let expenseCount;
-  if (user) {
-    expenseCount = await models.Expense.count({
-      where: {
-        [Op.or]: [{ CollectiveId: collective.id }, { FromCollectiveId: collective.id }, { UserId: user.id }],
-        status: ['PAID', 'PROCESSING', 'SCHEDULED_FOR_PAYMENT'],
-      },
-    });
-  } else {
-    expenseCount = await models.Expense.count({
-      where: {
-        [Op.or]: [{ CollectiveId: collective.id }, { FromCollectiveId: collective.id }],
-        status: ['PAID', 'PROCESSING', 'SCHEDULED_FOR_PAYMENT'],
-      },
-    });
-  }
-
-  const childrenCount = await models.Collective.count({
-    where: { ParentCollectiveId: collective.id, type: { [Op.in]: [EVENT, PROJECT] } },
-  });
-
-  if (transactionCount > 0 || orderCount > 0 || expenseCount > 0 || childrenCount > 0) {
-    return false;
-  }
-
-  return true;
+  return !hasUndeletableData;
 }
 
 export async function deleteCollective(collective) {
@@ -360,7 +378,7 @@ export async function deleteCollective(collective) {
       [Op.or]: [{ CollectiveId: collective.id }, { MemberCollectiveId: collective.id }],
     },
   });
-  await map(members, member => member.destroy(), { concurrency: 3 });
+  await map(members, (member: typeof models.Member) => member.destroy(), { concurrency: 3 });
 
   const orders = await models.Order.findAll({
     where: {
@@ -368,7 +386,7 @@ export async function deleteCollective(collective) {
       status: { [Op.not]: ['PAID', 'ACTIVE', 'CANCELLED'] },
     },
   });
-  await map(orders, order => order.destroy(), { concurrency: 3 });
+  await map(orders, (order: typeof models.Order) => order.destroy(), { concurrency: 3 });
 
   const expenses = await models.Expense.findAll({
     where: {
@@ -376,7 +394,7 @@ export async function deleteCollective(collective) {
       status: { [Op.not]: ['PAID', 'PROCESSING', 'SCHEDULED_FOR_PAYMENT'] },
     },
   });
-  await map(expenses, expense => expense.destroy(), { concurrency: 3 });
+  await map(expenses, (expense: typeof models.Expense) => expense.destroy(), { concurrency: 3 });
 
   const tiers = await models.Tier.findAll({
     where: { CollectiveId: collective.id },
@@ -386,7 +404,9 @@ export async function deleteCollective(collective) {
   const paymentMethods = await models.PaymentMethod.findAll({
     where: { CollectiveId: collective.id },
   });
-  await map(paymentMethods, paymentMethod => paymentMethod.destroy(), { concurrency: 3 });
+  await map(paymentMethods, (paymentMethod: typeof models.PaymentMethod) => paymentMethod.destroy(), {
+    concurrency: 3,
+  });
 
   const connectedAccounts = await models.ConnectedAccount.findAll({
     where: { CollectiveId: collective.id },
@@ -396,7 +416,9 @@ export async function deleteCollective(collective) {
   const memberInvitations = await models.MemberInvitation.findAll({
     where: { CollectiveId: collective.id },
   });
-  await map(memberInvitations, memberInvitation => memberInvitation.destroy(), { concurrency: 3 });
+  await map(memberInvitations, (memberInvitation: typeof models.MemberInvitation) => memberInvitation.destroy(), {
+    concurrency: 3,
+  });
 
   await collective.destroy();
 

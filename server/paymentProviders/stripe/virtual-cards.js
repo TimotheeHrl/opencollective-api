@@ -1,20 +1,18 @@
+import config from 'config';
 import { omit, pick } from 'lodash';
 
 import { activities } from '../../constants';
 import ExpenseStatus from '../../constants/expense_status';
 import ExpenseType from '../../constants/expense_type';
+import { VirtualCardLimitIntervals } from '../../constants/virtual-cards';
 import logger from '../../lib/logger';
 import { reportMessageToSentry } from '../../lib/sentry';
 import stripe, { convertToStripeAmount, StripeCustomToken } from '../../lib/stripe';
 import models from '../../models';
 import { getOrCreateVendor, getVirtualCardForTransaction, persistTransaction } from '../utils';
 
-const providerName = 'stripe';
-
 export const assignCardToCollective = async (cardNumber, expiryDate, cvv, name, collectiveId, host, userId) => {
-  const connectedAccount = await host.getAccountForPaymentProvider(providerName);
-
-  const stripe = getStripeClient(host.slug, connectedAccount.token);
+  const stripe = await getStripeClient(host);
 
   const list = await stripe.issuing.cards.list({ last4: cardNumber.slice(-4) });
   const cards = list.data;
@@ -50,10 +48,15 @@ export const assignCardToCollective = async (cardNumber, expiryDate, cvv, name, 
   return createCard(matchingCard, name, collectiveId, host.id, userId);
 };
 
-export const createVirtualCard = async (host, collective, userId, name, monthlyLimit) => {
-  const connectedAccount = await host.getAccountForPaymentProvider(providerName);
-
-  const stripe = getStripeClient(host.slug, connectedAccount.token);
+export const createVirtualCard = async (
+  host,
+  collective,
+  userId,
+  name,
+  limitAmount,
+  limitInterval = VirtualCardLimitIntervals.MONTHLY,
+) => {
+  const stripe = await getStripeClient(host);
 
   const cardholders = await stripe.issuing.cardholders.list({ type: 'company', status: 'active' });
 
@@ -71,8 +74,8 @@ export const createVirtualCard = async (host, collective, userId, name, monthlyL
       // eslint-disable-next-line camelcase
       spending_limits: [
         {
-          amount: monthlyLimit,
-          interval: 'monthly',
+          amount: limitAmount,
+          interval: limitInterval.toLowerCase(),
         },
       ],
     },
@@ -86,10 +89,13 @@ export const createVirtualCard = async (host, collective, userId, name, monthlyL
   return createCard(stripeCard, name, collective.id, host.id, userId);
 };
 
-export const updateVirtualCardMonthlyLimit = async (virtualCard, monthlyLimit) => {
+export const updateVirtualCardLimit = async (
+  virtualCard,
+  limitAmount,
+  limitInterval = VirtualCardLimitIntervals.MONTHLY,
+) => {
   const host = virtualCard.host;
-  const connectedAccount = await host.getAccountForPaymentProvider(providerName);
-  const stripe = getStripeClient(host.slug, connectedAccount.token);
+  const stripe = await getStripeClient(host);
 
   return stripe.issuing.cards.update(virtualCard.id, {
     // eslint-disable-next-line camelcase
@@ -97,8 +103,8 @@ export const updateVirtualCardMonthlyLimit = async (virtualCard, monthlyLimit) =
       // eslint-disable-next-line camelcase
       spending_limits: [
         {
-          amount: monthlyLimit,
-          interval: 'monthly',
+          amount: limitAmount,
+          interval: limitInterval.toLowerCase(),
         },
       ],
     },
@@ -107,8 +113,7 @@ export const updateVirtualCardMonthlyLimit = async (virtualCard, monthlyLimit) =
 
 const setCardStatus = async (virtualCard, status = 'canceled' | 'active' | 'inactive') => {
   const host = await virtualCard.getHost();
-  const connectedAccount = await host.getAccountForPaymentProvider(providerName);
-  const stripe = getStripeClient(host.slug, connectedAccount.token);
+  const stripe = await getStripeClient(host);
 
   const response = await stripe.issuing.cards.update(virtualCard.id, {
     status,
@@ -152,9 +157,8 @@ export const processAuthorization = async (stripeAuthorization, stripeEvent) => 
   const currency = stripeAuthorization.pending_request.currency.toUpperCase();
   const amount = convertToStripeAmount(currency, Math.abs(stripeAuthorization.pending_request.amount));
   const collective = virtualCard.collective;
-  const balance = await collective.getBalanceWithBlockedFundsAmount({ currency });
-  const connectedAccount = await host.getAccountForPaymentProvider(providerName);
-  const stripe = getStripeClient(host.slug, connectedAccount.token);
+  const balance = await collective.getBalanceAmount({ currency, withBlockedFunds: true });
+  const stripe = await getStripeClient(host);
 
   if (balance.value >= amount) {
     await stripe.issuing.authorizations.approve(stripeAuthorization.id);
@@ -212,6 +216,7 @@ export const processAuthorization = async (stripeAuthorization, stripeEvent) => 
         VirtualCardId: virtualCard.id,
         responsibleAdmin: responsibleAdmin.activity,
         collective: collective.activity,
+        expense: expense.info,
         amount,
         currency,
       },
@@ -340,15 +345,15 @@ const createCard = (stripeCard, name, collectiveId, hostId, userId) => {
 };
 
 export const processCardUpdate = async (stripeCard, stripeEvent) => {
-  if (stripeEvent) {
-    await checkStripeEvent(virtualCard.host, stripeEvent);
-  }
-
-  const virtualCard = await models.VirtualCard.findByPk(stripeCard.id);
+  const virtualCard = await models.VirtualCard.findByPk(stripeCard.id, { include: ['host'] });
   if (!virtualCard) {
     logger.error(`Stripe: could not find virtual card ${stripeCard.id}`, stripeEvent);
     reportMessageToSentry('Stripe: could not find virtual card', { extra: { stripeCard, stripeEvent } });
     return;
+  }
+
+  if (stripeEvent) {
+    await checkStripeEvent(virtualCard.host, stripeEvent);
   }
 
   await virtualCard.update({
@@ -361,20 +366,48 @@ export const processCardUpdate = async (stripeCard, stripeEvent) => {
 };
 
 const checkStripeEvent = async (host, stripeEvent) => {
-  const connectedAccount = await host.getAccountForPaymentProvider(providerName);
-  const stripe = getStripeClient(host.slug, connectedAccount.token);
+  const stripe = await getStripeClient(host);
 
+  const webhookSigningSecret = await getWebhookSigninSecret(host);
   try {
-    stripe.webhooks.constructEvent(
-      stripeEvent.rawBody,
-      stripeEvent.signature,
-      connectedAccount.data.stripeEndpointSecret,
-    );
+    stripe.webhooks.constructEvent(stripeEvent.rawBody, stripeEvent.signature, webhookSigningSecret);
   } catch {
     throw new Error('Source of event not recognized');
   }
 };
 
-const getStripeClient = (slug, token) => {
-  return slug === 'opencollective' ? stripe : StripeCustomToken(token);
+const getStripeClient = async host => {
+  if (host.slug === 'opencollective') {
+    return stripe;
+  }
+
+  const connectedAccount = await host.getAccountForPaymentProvider('stripe');
+
+  return StripeCustomToken(connectedAccount.token);
+};
+
+const getWebhookSigninSecret = async host => {
+  // Simply return webhookSigningSecret if set in dev environment
+  if (config.env === 'development' && config.stripe.webhookSigningSecret) {
+    return config.stripe.webhookSigningSecret;
+  }
+
+  // If slug opencollective, return webhookSigningSecret if set (staging, production)
+  if (host.slug === 'opencollective') {
+    if (config.stripe.webhookSigningSecret) {
+      return config.stripe.webhookSigningSecret;
+    }
+    throw new Error('Stripe Platform webhook signing secret not set for Platform');
+  }
+
+  const connectedAccount = await host.getAccountForPaymentProvider('stripe');
+  if (!connectedAccount) {
+    throw new Error('Stripe not connected for Host');
+  }
+
+  // stripeEndpointSecret is the older form, we should now use webhookSigningSecret which is more consistent
+  if (!connectedAccount.data?.webhookSigningSecret && !connectedAccount.data?.stripeEndpointSecret) {
+    throw new Error('Stripe Webhook Signin Secret not set for Host');
+  }
+  return connectedAccount.data?.webhookSigningSecret || connectedAccount.data.stripeEndpointSecret;
 };

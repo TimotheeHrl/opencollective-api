@@ -13,6 +13,7 @@ import {
 import { paypalAmountToCents } from '../../lib/paypal';
 import { formatCurrency } from '../../lib/utils';
 import models, { Op } from '../../models';
+import User from '../../models/User';
 
 import { paypalRequestV2 } from './api';
 
@@ -179,7 +180,7 @@ const processPaypalOrder = async (order, paypalOrderId): Promise<typeof models.T
 export const refundPaypalCapture = async (
   transaction: typeof models.Transaction,
   captureId: string,
-  user: typeof models.User,
+  user: User,
   reason: string,
 ): Promise<typeof models.Transaction> => {
   const host = await transaction.getHostCollective();
@@ -219,7 +220,7 @@ export async function processOrder(order: typeof models.Order): Promise<typeof m
   }
 }
 
-const getCaptureIdFromPaypalTransaction = transaction => {
+export const getCaptureIdFromPaypalTransaction = transaction => {
   const { data } = transaction;
   if (!data) {
     return null;
@@ -232,7 +233,7 @@ const getCaptureIdFromPaypalTransaction = transaction => {
 
 const refundPaypalPaymentTransaction = async (
   transaction: typeof models.Transaction,
-  user: typeof models.User,
+  user: User,
   reason: string,
 ): Promise<typeof models.Transaction> => {
   const captureId = getCaptureIdFromPaypalTransaction(transaction);

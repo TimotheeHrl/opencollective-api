@@ -3,12 +3,12 @@ import { GraphQLBoolean, GraphQLList, GraphQLNonNull, GraphQLString } from 'grap
 import { GraphQLJSON } from 'graphql-type-json';
 import { get, pick } from 'lodash';
 
-import activities from '../../../constants/activities';
 import POLICIES from '../../../constants/policies';
 import roles from '../../../constants/roles';
 import { purgeCacheForCollective } from '../../../lib/cache';
 import { isCollectiveSlugReserved } from '../../../lib/collectivelib';
 import * as github from '../../../lib/github';
+import { OSCValidator } from '../../../lib/osc-validator';
 import { getPolicy } from '../../../lib/policies';
 import RateLimit, { ONE_HOUR_IN_SECONDS } from '../../../lib/rate-limit';
 import { defaultHostCollective } from '../../../lib/utils';
@@ -38,7 +38,8 @@ async function createCollective(_, args, req) {
   const { remoteUser, loaders } = req;
 
   let user = remoteUser,
-    host;
+    host,
+    validatedRepositoryInfo;
 
   if (args.host) {
     host = await fetchAccountWithReference(args.host, { loaders });
@@ -86,36 +87,53 @@ async function createCollective(_, args, req) {
         });
       }
 
-      // Handle GitHub automated approval and apply to the Open Source Collective Host
-      const githubHandle = github.getGithubHandleFromUrl(collectiveData.repositoryUrl) || collectiveData.githubHandle;
-      if (args.automateApprovalWithGithub) {
+      // Throw validation error if you have not invited enough admins
+      const requiredAdmins = getPolicy(host, POLICIES.COLLECTIVE_MINIMUM_ADMINS)?.numberOfAdmins || 0;
+      const adminsIncludingInvitedCount = (args.inviteMembers?.length || 0) + 1;
+      if (requiredAdmins > adminsIncludingInvitedCount) {
+        throw new ValidationFailed(`This host policy requires at least ${requiredAdmins} admins for this account.`);
+      }
+
+      // Trigger automated Github approval when repository is on github.com (or using deprecated automateApprovaWithGithub argument )
+      const repositoryUrl = args.applicationData?.repositoryUrl || args.collective.repositoryUrl;
+      const { hostname } = repositoryUrl ? new URL(repositoryUrl) : { hostname: '' };
+      if (hostname === 'github.com' || args.automateApprovalWithGithub) {
+        const githubHandle = github.getGithubHandleFromUrl(repositoryUrl) || args.collective.githubHandle;
         const opensourceHost = defaultHostCollective('opensource');
         host = await loaders.Collective.byId.load(opensourceHost.CollectiveId);
+
         try {
           // For e2e testing, we enable testuser+(admin|member|host)@opencollective.com to create collective without github validation
           const bypassGithubValidation = !isProd && user.email.match(/.*test.*@opencollective.com$/);
+
           if (!bypassGithubValidation) {
             const githubAccount = await models.ConnectedAccount.findOne(
               { where: { CollectiveId: user.CollectiveId, service: 'github' } },
               { transaction },
             );
-            if (!githubAccount) {
-              throw new Error('You must have a connected GitHub Account to create a collective with GitHub.');
+            if (githubAccount) {
+              // In e2e/CI environment, checkGithubAdmin will be stubbed
+              await github.checkGithubAdmin(githubHandle, githubAccount.token);
+
+              if (githubHandle.includes('/')) {
+                validatedRepositoryInfo = OSCValidator(
+                  await github.getValidatorInfo(githubHandle, githubAccount.token),
+                );
+              }
             }
-            // In e2e/CI environment, checkGithubAdmin and checkGithubStars will be stubbed
-            await github.checkGithubAdmin(githubHandle, githubAccount.token);
-            await github.checkGithubStars(githubHandle, githubAccount.token);
           }
-          const policy = getPolicy(host, POLICIES.COLLECTIVE_MINIMUM_ADMINS);
-          shouldAutomaticallyApprove = policy?.numberOfAdmins > 1 ? false : true;
+          const { allValidationsPassed } = validatedRepositoryInfo || {};
+          shouldAutomaticallyApprove = allValidationsPassed || bypassGithubValidation;
         } catch (error) {
           throw new ValidationFailed(error.message);
         }
+
         if (githubHandle.includes('/')) {
           collectiveData.settings.githubRepo = githubHandle;
         } else {
           collectiveData.settings.githubOrg = githubHandle;
         }
+
         collectiveData.tags = collectiveData.tags || [];
         if (!collectiveData.tags.includes('open source')) {
           collectiveData.tags.push('open source');
@@ -168,13 +186,12 @@ async function createCollective(_, args, req) {
           shouldAutomaticallyApprove = true;
         }
       }
-
       // Add the host if any
       if (host) {
         await collective.addHost(host, user, {
           shouldAutomaticallyApprove,
           message: args.message,
-          applicationData: args.applicationData,
+          applicationData: { ...args.applicationData, validatedRepositoryInfo },
         });
         purgeCacheForCollective(host.slug);
       }
@@ -185,21 +202,14 @@ async function createCollective(_, args, req) {
       // - tell them the status of their host application
       if (!args.skipDefaultAdmin) {
         const remoteUserCollective = await loaders.Collective.byId.load(user.CollectiveId);
-        models.Activity.create({
-          type: activities.COLLECTIVE_CREATED,
-          UserId: user.id,
-          UserTokenId: req.userToken?.id,
-          CollectiveId: get(host, 'id'), // TODO(InconsistentActivities): Should be collective.id
-          HostCollectiveId: get(host, 'id'),
-          data: {
-            collective: collective.info,
-            host: get(host, 'info'),
-            hostPending: collective.approvedAt ? false : true,
-            accountType: collective.type === 'FUND' ? 'fund' : 'collective',
-            user: {
-              email: user.email,
-              collective: remoteUserCollective.info,
-            },
+        collective.generateCollectiveCreatedActivity(req.remoteUser, req.userToken, {
+          collective: collective.info,
+          host: get(host, 'info'),
+          hostPending: collective.approvedAt ? false : true,
+          accountType: collective.type === 'FUND' ? 'fund' : 'collective',
+          user: {
+            email: user.email,
+            collective: remoteUserCollective.info,
           },
         });
       }
@@ -228,6 +238,7 @@ const createCollectiveMutation = {
       description: 'Whether to trigger the automated approval for Open Source collectives with GitHub.',
       type: GraphQLBoolean,
       defaultValue: false,
+      deprecationReason: '2022-10-12: This is now automated',
     },
     message: {
       type: GraphQLString,

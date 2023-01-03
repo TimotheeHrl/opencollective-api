@@ -5,11 +5,12 @@ import config from 'config';
 import { SequelizeValidationError } from 'sequelize';
 import { stub, useFakeTimers } from 'sinon';
 
+import { Service } from '../../../server/constants/connected_account';
 import * as auth from '../../../server/lib/auth';
 import models from '../../../server/models';
 import { randEmail } from '../../stores';
+import { fakeConnectedAccount, fakeUser, multiple } from '../../test-helpers/fake-data';
 import * as utils from '../../utils';
-
 const userData = utils.data('user1');
 
 const { User } = models;
@@ -174,6 +175,64 @@ describe('server/models/User', () => {
           expect(user2.collective.slug).to.equal('xavier-damman1');
           expect(user2.collective.name).to.equal('Xavier Damman');
         });
+    });
+  });
+
+  describe('findRelatedUsersByIp', () => {
+    it('returns empty list if there are no other useres sharing the same IP', async () => {
+      await fakeUser({ data: { lastSignInRequest: { ip: '201.32.14.2' }, creationRequest: { ip: '201.32.14.2' } } });
+      const user = await fakeUser({ data: { creationRequest: { ip: '143.23.13.2' } } });
+
+      const relatedUsers = await user.findRelatedUsersByIp();
+      expect(relatedUsers).to.have.length(0);
+    });
+
+    it('returns list of users that are using the same IP address', async () => {
+      const ip = '192.168.0.27';
+
+      await fakeUser({ data: { lastSignInRequest: { ip: '201.32.14.2' }, creationRequest: { ip: '201.32.14.2' } } });
+      const otherUser = await fakeUser({ data: { lastSignInRequest: { ip } } });
+      const user = await fakeUser({ data: { creationRequest: { ip } } });
+
+      const relatedUsers = await user.findRelatedUsersByIp();
+      expect(relatedUsers).to.have.length(1);
+      expect(relatedUsers).to.have.nested.property('[0].id', otherUser.id);
+    });
+  });
+
+  describe('findRelatedUsersByConnectedAccounts', () => {
+    let user1, user2, user3, user4;
+    beforeEach(async () => {
+      [user1, user2, user3, user4] = await multiple(fakeUser, 10, {});
+      await fakeConnectedAccount({ CollectiveId: user1.CollectiveId, service: Service.GITHUB, username: 'bob' });
+      await fakeConnectedAccount({ CollectiveId: user2.CollectiveId, service: Service.GITHUB, username: 'bob' });
+      await fakeConnectedAccount({ CollectiveId: user1.CollectiveId, service: Service.STRIPE, username: 'bob' });
+      await fakeConnectedAccount({ CollectiveId: user3.CollectiveId, service: Service.STRIPE, username: 'bob' });
+      await fakeConnectedAccount({
+        CollectiveId: user1.CollectiveId,
+        service: Service.PAYPAL,
+        username: 'bob@hotmail.com',
+      });
+      await fakeConnectedAccount({
+        CollectiveId: user4.CollectiveId,
+        service: Service.PAYPAL,
+        username: 'bob@hotmail.com',
+      });
+    });
+
+    it('should return related users if another user has the same username', async () => {
+      let relatedUsers = await user1.findRelatedUsersByConnectedAccounts();
+
+      expect(relatedUsers).to.containSubset([{ id: user2.id }, { id: user4.id }]);
+
+      relatedUsers = await user4.findRelatedUsersByConnectedAccounts();
+      expect(relatedUsers).to.containSubset([{ id: user1.id }]);
+    });
+
+    it('should not include irrelevant services', async () => {
+      const relatedUsers = await user1.findRelatedUsersByConnectedAccounts();
+
+      expect(relatedUsers).to.not.containSubset([{ id: user3.id }]);
     });
   });
 });

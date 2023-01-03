@@ -32,7 +32,6 @@ import errorHandler from './middleware/error_handler';
 import * as params from './middleware/params';
 import required from './middleware/required_param';
 import sanitizer from './middleware/sanitizer';
-import alipay from './paymentProviders/stripe/alipay';
 
 const upload = multer();
 
@@ -245,7 +244,6 @@ export default async app => {
   app.post('/webhooks/privacy', privacyWebhook); // when it gets a new subscription invoice
   app.post('/webhooks/paypal/:hostId?', paypalWebhook);
   app.post('/webhooks/thegivingblock', thegivingblockWebhook);
-  app.post('/webhooks/mailgun', email.webhook); // when receiving an email
   app.get('/connected-accounts/:service/callback', noCache, authentication.authenticateServiceCallback); // oauth callback
   app.delete(
     '/connected-accounts/:service/disconnect/:collectiveId',
@@ -280,9 +278,6 @@ export default async app => {
     authentication.parseJwtNoExpiryCheck,
     connectedAccounts.verify,
   );
-
-  /* AliPay Payment Callback */
-  app.get('/services/stripe/alipay/callback', noCache, alipay.confirmOrder);
 
   /* TransferWise OTT Request Endpoint */
   app.post('/services/transferwise/pay-batch', noCache, transferwise.payBatch);

@@ -252,6 +252,20 @@ export const UserType = new GraphQLObjectType({
           return hasSeenLatestChangelogEntry(user);
         },
       },
+      hasTwoFactorAuth: {
+        type: GraphQLBoolean,
+        resolve(user, _, req) {
+          if (req.remoteUser.id === user.id) {
+            return Boolean(user.twoFactorAuthToken);
+          }
+        },
+      },
+      isRoot: {
+        type: new GraphQLNonNull(GraphQLBoolean),
+        resolve(user) {
+          return user.isRoot();
+        },
+      },
     };
   },
 });
@@ -521,8 +535,9 @@ export const ContributorType = new GraphQLObjectType({
       description: 'True if the contributor is a financial contributor',
     },
     isFundraiser: {
-      type: new GraphQLNonNull(GraphQLBoolean),
+      type: GraphQLBoolean,
       description: 'True if the contributor is a fundraiser',
+      deprecationReason: '2022-09-12: This role does not exist anymore',
     },
     tiersIds: {
       type: new GraphQLNonNull(new GraphQLList(GraphQLInt)),
@@ -1596,7 +1611,9 @@ export const OrderType = new GraphQLObjectType({
             return {};
           }
 
-          return order.getCreatedByUser();
+          if (order.CreatedByUserId) {
+            return req.loaders.User.byId.load(order.CreatedByUserId);
+          }
         },
       },
       description: {
@@ -1651,10 +1668,11 @@ export const OrderType = new GraphQLObjectType({
           'Payment method used to pay for the order. The paymentMethod is also attached to individual transactions since a credit card can change over the lifetime of a subscription.',
         type: PaymentMethodType,
         resolve(order, args, req) {
-          if (!req.remoteUser) {
+          if (!order.PaymentMethodId || !order.FromCollectiveId || !req.remoteUser?.isAdmin(order.FromCollectiveId)) {
             return null;
+          } else {
+            return req.loaders.PaymentMethod.byId.load(order.PaymentMethodId);
           }
-          return order.getPaymentMethodForUser(req.remoteUser);
         },
       },
       transactions: {

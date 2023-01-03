@@ -12,6 +12,7 @@ import {
   isNumber,
   keyBy,
   mapValues,
+  omit,
   omitBy,
   pick,
   set,
@@ -30,26 +31,26 @@ import FEATURE from '../../constants/feature';
 import { EXPENSE_PERMISSION_ERROR_CODES } from '../../constants/permissions';
 import POLICIES from '../../constants/policies';
 import { TransactionKind } from '../../constants/transaction-kind';
+import cache from '../../lib/cache';
 import { getFxRate } from '../../lib/currency';
 import { simulateDBEntriesDiff } from '../../lib/data';
 import errors from '../../lib/errors';
 import logger from '../../lib/logger';
 import { floatAmountToCents } from '../../lib/math';
 import * as libPayments from '../../lib/payments';
-import { hasPolicy } from '../../lib/policies';
+import { getPolicy } from '../../lib/policies';
+import { reportErrorToSentry, reportMessageToSentry } from '../../lib/sentry';
 import { notifyTeamAboutSpamExpense } from '../../lib/spam';
 import { createTransactionsFromPaidExpense } from '../../lib/transactions';
-import {
-  handleTwoFactorAuthenticationPayoutLimit,
-  resetRollingPayoutLimitOnFailure,
-} from '../../lib/two-factor-authentication';
+import twoFactorAuthLib from '../../lib/two-factor-authentication';
 import { canUseFeature } from '../../lib/user-permissions';
-import { formatCurrency } from '../../lib/utils';
+import { formatCurrency, parseToBoolean } from '../../lib/utils';
 import models, { sequelize } from '../../models';
 import { ExpenseAttachedFile } from '../../models/ExpenseAttachedFile';
 import { ExpenseItem } from '../../models/ExpenseItem';
 import { MigrationLogType } from '../../models/MigrationLog';
 import { PayoutMethodTypes } from '../../models/PayoutMethod';
+import User from '../../models/User';
 import paymentProviders from '../../paymentProviders';
 import {
   Quote as WiseQuote,
@@ -144,6 +145,13 @@ const isHostAdmin = async (req: express.Request, expense: typeof models.Expense)
   return req.remoteUser.isAdmin(expense.collective.HostCollectiveId) && expense.collective.isActive;
 };
 
+const isAdminOfHostWhoPaidExpense = async (req: express.Request, expense: typeof models.Expense): Promise<boolean> => {
+  if (!req.remoteUser) {
+    return false;
+  }
+  return expense.HostCollectiveId && req.remoteUser.isAdmin(expense.HostCollectiveId);
+};
+
 export type ExpensePermissionEvaluator = (
   req: express.Request,
   expense: typeof models.Expense,
@@ -184,12 +192,24 @@ const remoteUserMeetsOneCondition = async (
 
 /** Checks if the user can see expense's attachments (items URLs, attached files) */
 export const canSeeExpenseAttachments: ExpensePermissionEvaluator = async (req, expense) => {
-  return remoteUserMeetsOneCondition(req, expense, [isOwner, isCollectiveAdmin, isCollectiveAccountant, isHostAdmin]);
+  return remoteUserMeetsOneCondition(req, expense, [
+    isOwner,
+    isCollectiveAdmin,
+    isCollectiveAccountant,
+    isHostAdmin,
+    isAdminOfHostWhoPaidExpense,
+  ]);
 };
 
 /** Checks if the user can see expense's payout method */
 export const canSeeExpensePayoutMethod: ExpensePermissionEvaluator = async (req, expense) => {
-  return remoteUserMeetsOneCondition(req, expense, [isOwner, isCollectiveAdmin, isCollectiveAccountant, isHostAdmin]);
+  return remoteUserMeetsOneCondition(req, expense, [
+    isOwner,
+    isCollectiveAdmin,
+    isCollectiveAccountant,
+    isHostAdmin,
+    isAdminOfHostWhoPaidExpense,
+  ]);
 };
 
 /** Checks if the user can see expense's payout method */
@@ -201,14 +221,24 @@ export const canSeeExpenseInvoiceInfo: ExpensePermissionEvaluator = async (
   return remoteUserMeetsOneCondition(
     req,
     expense,
-    [isOwner, isCollectiveAdmin, isCollectiveAccountant, isHostAdmin],
+    [isOwner, isCollectiveAdmin, isCollectiveAccountant, isHostAdmin, isAdminOfHostWhoPaidExpense],
     options,
   );
 };
 
 /** Checks if the user can see expense's payout method */
 export const canSeeExpensePayeeLocation: ExpensePermissionEvaluator = async (req, expense) => {
-  return remoteUserMeetsOneCondition(req, expense, [isOwner, isCollectiveAdmin, isCollectiveAccountant, isHostAdmin]);
+  return remoteUserMeetsOneCondition(req, expense, [
+    isOwner,
+    isCollectiveAdmin,
+    isCollectiveAccountant,
+    isHostAdmin,
+    isAdminOfHostWhoPaidExpense,
+  ]);
+};
+
+export const canSeeExpenseSecurityChecks: ExpensePermissionEvaluator = async (req, expense) => {
+  return remoteUserMeetsOneCondition(req, expense, [isHostAdmin]);
 };
 
 /** Checks if the user can verify or resend a draft */
@@ -352,11 +382,39 @@ export const canApprove: ExpensePermissionEvaluator = async (req, expense, optio
     return false;
   } else {
     expense.collective = expense.collective || (await req.loaders.Collective.byId.load(expense.CollectiveId));
-    if (hasPolicy(expense.collective, POLICIES.EXPENSE_AUTHOR_CANNOT_APPROVE) && req.remoteUser.id === expense.UserId) {
+
+    if (expense.collective.HostCollectiveId && expense.collective.approvedAt) {
+      expense.collective.host =
+        expense.collective.host || (await req.loaders.Collective.byId.load(expense.collective.HostCollectiveId));
+    }
+
+    const currency = expense.collective.host?.currency || expense.collective.currency;
+    const hostPolicy = getPolicy(expense.collective.host, POLICIES.EXPENSE_AUTHOR_CANNOT_APPROVE);
+    const collectivePolicy = getPolicy(expense.collective, POLICIES.EXPENSE_AUTHOR_CANNOT_APPROVE);
+
+    let policy = collectivePolicy;
+    if (hostPolicy.enabled && hostPolicy.appliesToHostedCollectives) {
+      policy = hostPolicy;
+
+      if (!hostPolicy.appliesToSingleAdminCollectives) {
+        const collectiveAdminCount = await req.loaders.Member.countAdminMembersOfCollective.load(expense.collective.id);
+        if (collectiveAdminCount === 1) {
+          policy = collectivePolicy;
+        }
+      }
+    }
+
+    if (policy.enabled && expense.amount >= policy.amountInCents && req.remoteUser.id === expense.UserId) {
       if (options?.throw) {
         throw new Forbidden(
           'User cannot approve their own expenses',
           EXPENSE_PERMISSION_ERROR_CODES.AUTHOR_CANNOT_APPROVE,
+          {
+            reasonDetails: {
+              amount: policy.amountInCents / 100,
+              currency,
+            },
+          },
         );
       }
       return false;
@@ -504,7 +562,13 @@ export const canComment: ExpensePermissionEvaluator = async (req, expense, optio
 };
 
 export const canViewRequiredLegalDocuments: ExpensePermissionEvaluator = async (req, expense) => {
-  return remoteUserMeetsOneCondition(req, expense, [isHostAdmin, isCollectiveAdmin, isCollectiveAccountant, isOwner]);
+  return remoteUserMeetsOneCondition(req, expense, [
+    isHostAdmin,
+    isCollectiveAdmin,
+    isCollectiveAccountant,
+    isOwner,
+    isAdminOfHostWhoPaidExpense,
+  ]);
 };
 
 export const canUnschedulePayment: ExpensePermissionEvaluator = async (req, expense, options = { throw: false }) => {
@@ -611,10 +675,49 @@ export const markExpenseAsSpam = async (
   return updatedExpense;
 };
 
+const ROLLING_LIMIT_CACHE_VALIDITY = 3600; // 1h in secs for cache to expire
+
+async function validateExpensePayout2FALimit(req, host, expense, expensePaidAmountKey) {
+  const hostPayoutTwoFactorAuthenticationRollingLimit = get(
+    host,
+    'settings.payoutsTwoFactorAuth.rollingLimit',
+    1000000,
+  );
+
+  const twoFactorSession = req.jwtPayload?.sessionId || (req.clientApp?.id && `app_${req.clientApp.id}`);
+
+  const currentPaidExpenseAmountCache = await cache.get(expensePaidAmountKey);
+  const currentPaidExpenseAmount = currentPaidExpenseAmountCache || 0;
+
+  // requires a 2FA token to be present if there is no value in the cache (first payout by user)
+  // or the this payout would put the user over the rolling limit.
+  const use2FAToken =
+    isNil(currentPaidExpenseAmountCache) ||
+    currentPaidExpenseAmount + expense.amount > hostPayoutTwoFactorAuthenticationRollingLimit;
+
+  if (!twoFactorAuthLib.userHasTwoFactorAuthEnabled(req.remoteUser)) {
+    throw new Error('Host has two-factor authentication enabled for large payouts.');
+  }
+
+  await twoFactorAuthLib.validateRequest(req, {
+    requireTwoFactorAuthEnabled: true, // requires user to have 2FA configured
+    alwaysAskForToken: use2FAToken,
+    sessionDuration: ROLLING_LIMIT_CACHE_VALIDITY, // duration of a auth session after a token is presented
+    sessionKey: `2fa_expense_payout_${twoFactorSession}`, // key of the 2fa session where the 2fa will be valid for the duration
+  });
+
+  if (use2FAToken) {
+    // if a 2fa token was used, reset rolling limit
+    cache.set(expensePaidAmountKey, 0, ROLLING_LIMIT_CACHE_VALIDITY);
+  } else {
+    cache.set(expensePaidAmountKey, currentPaidExpenseAmount + expense.amount, ROLLING_LIMIT_CACHE_VALIDITY);
+  }
+}
+
 export const scheduleExpenseForPayment = async (
   req: express.Request,
   expense: typeof models.Expense,
-  options: { feesPayer?: 'COLLECTIVE' | 'PAYEE'; twoFactorAuthenticatorCode?: string } = {},
+  options: { feesPayer?: 'COLLECTIVE' | 'PAYEE' } = {},
 ): Promise<typeof models.Expense> => {
   if (expense.status === expenseStatus.SCHEDULED_FOR_PAYMENT) {
     throw new BadRequest('Expense is already scheduled for payment');
@@ -633,12 +736,8 @@ export const scheduleExpenseForPayment = async (
     const hostHasPayoutTwoFactorAuthenticationEnabled = get(host, 'settings.payoutsTwoFactorAuth.enabled', false);
 
     if (hostHasPayoutTwoFactorAuthenticationEnabled) {
-      await handleTwoFactorAuthenticationPayoutLimit(
-        req.remoteUser,
-        options.twoFactorAuthenticatorCode,
-        expense,
-        req.jwtPayload?.sessionId || (req.clientApp?.id && `app_${req.clientApp.id}`) || 'noSessionId',
-      );
+      const expensePaidAmountKey = `${req.remoteUser.id}_2fa_payment_limit`;
+      await validateExpensePayout2FALimit(req, host, expense, expensePaidAmountKey);
     }
   }
 
@@ -807,7 +906,7 @@ const createAttachedFiles = async (expense, attachedFilesData, remoteUser, trans
   if (size(attachedFilesData) > 0) {
     return Promise.all(
       attachedFilesData.map(attachedFile => {
-        return models.ExpenseAttachedFile.createFromData(attachedFile.url, remoteUser, expense, transaction);
+        return models.ExpenseAttachedFile.createFromData(attachedFile, remoteUser, expense, transaction);
       }),
     );
   } else {
@@ -852,7 +951,7 @@ const checkTaxes = (account, host, expenseType: string, taxes): void => {
     return taxes.forEach(({ type, rate }) => {
       if (rate < 0 || rate > 1) {
         throw new ValidationFailed(`Tax rate for ${type} must be between 0% and 100%`);
-      } else if (type === LibTaxes.TaxType.VAT && !LibTaxes.accountHasVAT(account)) {
+      } else if (type === LibTaxes.TaxType.VAT && !LibTaxes.accountHasVAT(account, host)) {
         throw new ValidationFailed(`This account does not have VAT enabled`);
       } else if (type === LibTaxes.TaxType.GST && !LibTaxes.accountHasGST(host)) {
         throw new ValidationFailed(`This host does not have GST enabled`);
@@ -861,10 +960,7 @@ const checkTaxes = (account, host, expenseType: string, taxes): void => {
   }
 };
 
-export async function createExpense(
-  remoteUser: typeof models.User | null,
-  expenseData: ExpenseData,
-): Promise<typeof models.Expense> {
+export async function createExpense(remoteUser: User | null, expenseData: ExpenseData): Promise<typeof models.Expense> {
   if (!remoteUser) {
     throw new Unauthorized('You need to be logged in to create an expense');
   } else if (!canUseFeature(remoteUser, FEATURE.USE_EXPENSES)) {
@@ -1114,6 +1210,15 @@ export async function editExpense(
   const { collective } = expense;
   const { host } = collective;
 
+  // Check if 2FA is enforced on any of the account remote user is admin of, stop the loop if 2FA gets validated for any of them
+  if (req.remoteUser) {
+    for (const account of [expense.fromCollective, collective, host].filter(Boolean)) {
+      if (await twoFactorAuthLib.enforceForAccountAdmins(req, account, { onlyAskOnLogin: true })) {
+        break;
+      }
+    }
+  }
+
   // When changing the type, we must make sure that the new type is allowed
   if (expenseData.type && expenseData.type !== expense.type) {
     checkExpenseType(expenseData.type, collective, collective.parent, collective.host);
@@ -1254,7 +1359,10 @@ export async function editExpense(
       await Promise.all(removedAttachedFiles.map((file: ExpenseAttachedFile) => file.destroy()));
       await Promise.all(
         updatedAttachedFiles.map((file: Record<string, unknown>) =>
-          models.ExpenseAttachedFile.update({ url: file.url }, { where: { id: file.id, ExpenseId: expense.id } }),
+          models.ExpenseAttachedFile.update(
+            { url: file.url, name: file.name },
+            { where: { id: file.id, ExpenseId: expense.id } },
+          ),
         ),
       );
     }
@@ -1349,8 +1457,12 @@ async function payExpenseWithPayPalAdaptive(remoteUser, expense, host, paymentMe
 
   if (expense.currency !== expense.collective.currency) {
     throw new Error(
-      'Multi-currency expenses are not supported by the legacy PayPal adaptive implementation. Please migrate to PayPal payouts.',
+      'Multi-currency expenses are not supported by the legacy PayPal adaptive implementation. Please migrate to PayPal payouts: https://docs.opencollective.com/help/fiscal-hosts/payouts/payouts-with-paypal',
     );
+  }
+
+  if (parseToBoolean(process.env.DISABLE_PAYPAL_ADAPTIVE) && !remoteUser.isRoot()) {
+    throw new Error('PayPal adaptive is currently under maintenance. Please try again later.');
   }
 
   try {
@@ -1361,6 +1473,7 @@ async function payExpenseWithPayPalAdaptive(remoteUser, expense, host, paymentMe
       paymentMethod.token,
     );
 
+    debug(JSON.stringify(paymentResponse));
     const { createPaymentResponse, executePaymentResponse } = paymentResponse;
 
     switch (executePaymentResponse.paymentExecStatus) {
@@ -1394,13 +1507,28 @@ async function payExpenseWithPayPalAdaptive(remoteUser, expense, host, paymentMe
     }
 
     // Warning senderFees can be null
-    const senderFees = createPaymentResponse.defaultFundingPlan.senderFees;
-    const paymentProcessorFeeInCollectiveCurrency = senderFees ? senderFees.amount * 100 : 0; // paypal sends this in float
+    let senderFees = createPaymentResponse.defaultFundingPlan.senderFees?.amount;
+    if (senderFees) {
+      senderFees = floatAmountToCents(parseFloat(senderFees));
+    } else {
+      // PayPal stopped providing senderFees in the response, we need to compute it ourselves
+      // We don't have to check for feesPayer here because it is not supported for PayPal adaptive
+      const { fundingAmount } = createPaymentResponse.defaultFundingPlan;
+      const amountPaidByTheHost = floatAmountToCents(parseFloat(fundingAmount.amount));
+      const amountReceivedByPayee = expense.amount;
+      senderFees = Math.round(amountPaidByTheHost - amountReceivedByPayee) || 0;
+
+      // No example yet, but we want to know if this ever happens
+      if (fundingAmount.code !== expense.currency) {
+        reportMessageToSentry(`PayPal adaptive got a funding amount with a different currency than the expense`, {
+          severity: 'error',
+        });
+      }
+    }
+
     const currencyConversion = createPaymentResponse.defaultFundingPlan.currencyConversion || { exchangeRate: 1 };
     const hostCurrencyFxRate = 1 / parseFloat(currencyConversion.exchangeRate); // paypal returns a float from host.currency to expense.currency
-    fees['paymentProcessorFeeInHostCurrency'] = Math.round(
-      hostCurrencyFxRate * paymentProcessorFeeInCollectiveCurrency,
-    );
+    fees['paymentProcessorFeeInHostCurrency'] = Math.round(hostCurrencyFxRate * senderFees);
 
     // Adaptive does not work with multi-currency expenses, so we can safely assume that expense.currency = collective.currency
     await createTransactionsFromPaidExpense(host, expense, fees, hostCurrencyFxRate, paymentResponse, paymentMethod);
@@ -1416,6 +1544,7 @@ async function payExpenseWithPayPalAdaptive(remoteUser, expense, host, paymentMe
         'Not enough funds in your existing Paypal preapproval. Please refill your PayPal payment balance.',
       );
     } else {
+      reportErrorToSentry(err);
       throw new BadRequest(err.message);
     }
   }
@@ -1778,21 +1907,29 @@ export async function payExpense(req: express.Request, args: Record<string, unkn
       PayoutMethodTypes.BANK_ACCOUNT,
     ].includes(payoutMethodType);
     const hostHasPayoutTwoFactorAuthenticationEnabled = get(host, 'settings.payoutsTwoFactorAuth.enabled', false);
-    const useTwoFactorAuthentication =
+    const use2FARollingLimit =
       isTwoFactorAuthenticationRequiredForPayoutMethod && !forceManual && hostHasPayoutTwoFactorAuthenticationEnabled;
 
-    if (useTwoFactorAuthentication) {
-      await handleTwoFactorAuthenticationPayoutLimit(
-        req.remoteUser,
-        args.twoFactorAuthenticatorCode,
-        expense,
-        req.jwtPayload?.sessionId || (req.clientApp?.id && `app_${req.clientApp.id}`) || 'noSessionId',
-      );
+    const totalPaidExpensesAmountKey = `${req.remoteUser.id}_2fa_payment_limit`;
+    let totalPaidExpensesAmount;
+
+    if (use2FARollingLimit) {
+      totalPaidExpensesAmount = await cache.get(totalPaidExpensesAmountKey);
+      await validateExpensePayout2FALimit(req, host, expense, totalPaidExpensesAmountKey);
+    } else {
+      // Not using rolling limit, but still enforcing 2FA for all admins
+      await twoFactorAuthLib.enforceForAccountAdmins(req, host, { onlyAskOnLogin: true });
     }
 
     try {
       // Pay expense based on chosen payout method
       if (payoutMethodType === PayoutMethodTypes.PAYPAL) {
+        if (expense.collective.currency !== host.currency) {
+          throw new Error(
+            'PayPal adaptive payouts are not supported when the collective currency is different from the host currency. Please migrate to PayPal payouts: https://docs.opencollective.com/help/fiscal-hosts/payouts/payouts-with-paypal',
+          );
+        }
+
         const paypalEmail = payoutMethod.data.email;
         let paypalPaymentMethod = null;
         try {
@@ -1804,9 +1941,9 @@ export async function payExpense(req: express.Request, args: Record<string, unkn
         // then we simply mark the expense as paid
         if (paypalPaymentMethod && paypalEmail === paypalPaymentMethod.name) {
           feesInHostCurrency['paymentProcessorFeeInHostCurrency'] = 0;
-          await createTransactionsFromPaidExpense(host, expense, feesInHostCurrency, 'auto');
+          await createTransactionsFromPaidExpense(host, expense, feesInHostCurrency, 'auto', { isManual: true });
         } else if (forceManual) {
-          await createTransactionsFromPaidExpense(host, expense, feesInHostCurrency, 'auto');
+          await createTransactionsFromPaidExpense(host, expense, feesInHostCurrency, 'auto', { isManual: true });
         } else if (paypalPaymentMethod) {
           return payExpenseWithPayPalAdaptive(
             remoteUser,
@@ -1821,7 +1958,10 @@ export async function payExpense(req: express.Request, args: Record<string, unkn
         }
       } else if (payoutMethodType === PayoutMethodTypes.BANK_ACCOUNT) {
         if (forceManual) {
-          await createTransactionsFromPaidExpense(host, expense, feesInHostCurrency, 'auto');
+          await expense.update({
+            data: omit(expense.data, ['transfer', 'quote', 'fund', 'recipient', 'paymentOption']),
+          });
+          await createTransactionsFromPaidExpense(host, expense, feesInHostCurrency, 'auto', { isManual: true });
         } else {
           const [connectedAccount] = await host.getConnectedAccounts({
             where: { service: 'transferwise', deletedAt: null },
@@ -1858,8 +1998,10 @@ export async function payExpense(req: express.Request, args: Record<string, unkn
         await createTransactionsFromPaidExpense(host, expense, feesInHostCurrency, 'auto');
       }
     } catch (error) {
-      if (useTwoFactorAuthentication) {
-        await resetRollingPayoutLimitOnFailure(req.remoteUser, expense);
+      if (use2FARollingLimit) {
+        if (!isNil(totalPaidExpensesAmount) && totalPaidExpensesAmount !== 0) {
+          cache.set(totalPaidExpensesAmountKey, totalPaidExpensesAmount - expense.amount, ROLLING_LIMIT_CACHE_VALIDITY);
+        }
       }
 
       throw error;

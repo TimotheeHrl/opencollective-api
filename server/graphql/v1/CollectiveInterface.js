@@ -29,6 +29,7 @@ import { hostResolver } from '../common/collective';
 import { getContextPermission, PERMISSION_TYPE } from '../common/context-permissions';
 import { getFeatureStatusResolver } from '../common/features';
 import { getIdEncodeResolver, IDENTIFIER_TYPES } from '../v2/identifiers';
+import { Policies } from '../v2/object/Policies';
 
 import { ApplicationType } from './Application';
 import { TransactionInterfaceType } from './TransactionInterface';
@@ -492,8 +493,8 @@ export const CollectiveStatsType = new GraphQLObjectType({
       totalAmountSpent: {
         description: 'Total amount spent',
         type: GraphQLInt,
-        resolve(collective) {
-          return collective.getTotalAmountSpent();
+        resolve(collective, _, req) {
+          return collective.getTotalAmountSpent({ loaders: req.loaders, net: true });
         },
       },
       totalAmountReceived: {
@@ -507,7 +508,7 @@ export const CollectiveStatsType = new GraphQLObjectType({
             description: 'Computes contributions from the last x months. Cannot be used with startDate/endDate',
           },
         },
-        resolve(collective, args) {
+        resolve(collective, args, req) {
           let startDate = args.startDate ? new Date(args.startDate) : null;
           let endDate = args.endDate ? new Date(args.endDate) : null;
 
@@ -516,14 +517,14 @@ export const CollectiveStatsType = new GraphQLObjectType({
             endDate = null;
           }
 
-          return collective.getTotalAmountReceived({ startDate, endDate });
+          return collective.getTotalAmountReceived({ loaders: req.loaders, startDate, endDate });
         },
       },
       totalNetAmountReceived: {
         description: 'Total net amount received',
         type: GraphQLInt,
-        resolve(collective) {
-          return collective.getTotalNetAmountReceived();
+        resolve(collective, _, req) {
+          return collective.getTotalAmountReceived({ loaders: req.loaders, net: true });
         },
       },
       yearlyBudget: {
@@ -878,6 +879,11 @@ export const CollectiveInterfaceType = new GraphQLInterfaceType({
       categories: {
         type: new GraphQLNonNull(new GraphQLList(GraphQLString)),
         description: 'Categories set by Open Collective to help moderation.',
+      },
+      policies: {
+        type: new GraphQLNonNull(Policies),
+        description:
+          'Policies for the account. To see non-public policies you need to be admin and have the scope: "account".',
       },
     };
   },
@@ -1925,6 +1931,12 @@ const CollectiveFields = () => {
       type: new GraphQLNonNull(new GraphQLList(GraphQLString)),
       resolve(collective) {
         return get(collective.data, 'categories', []);
+      },
+    },
+    policies: {
+      type: new GraphQLNonNull(Policies),
+      resolve(account) {
+        return account;
       },
     },
   };

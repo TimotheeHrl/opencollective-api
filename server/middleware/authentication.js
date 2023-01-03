@@ -157,7 +157,7 @@ export const _authenticateUserByJwt = async (req, res, next) => {
       await confirmGuestAccount(user);
     }
 
-    if (!parseToBoolean(config.database.readOnly)) {
+    if (!parseToBoolean(config.database.readOnly) && req.jwtPayload?.traceless !== true) {
       await user.update({
         // The login was accepted, we can update lastLoginAt. This will invalidate all older tokens.
         lastLoginAt: new Date(),
@@ -214,6 +214,8 @@ export const authenticateService = (req, res, next) => {
       opts.scope = [
         // We need this to call github.getOrgMemberships and check if the user is an admin of a given Organization
         'read:org',
+        // We need this for the `github.getValidatorInfo` query
+        'public_repo',
       ];
     } else {
       // We try to deprecate this scope by progressively forcing a context

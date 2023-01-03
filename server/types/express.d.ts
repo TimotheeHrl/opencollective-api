@@ -1,12 +1,12 @@
 import DataLoader from 'dataloader';
 
-import models from '../models';
+import User from '../models/User';
 import UserToken from '../models/UserToken';
 
 declare global {
   namespace Express {
     interface Request {
-      remoteUser?: typeof models.User;
+      remoteUser?: User | null;
       jwtPayload?: {
         sessionId?: string;
         iat: number;
@@ -22,6 +22,7 @@ declare global {
       };
       userToken?: UserToken;
       loaders: Record<string, DataLoader>;
+      rawBody?: string;
     }
   }
 }

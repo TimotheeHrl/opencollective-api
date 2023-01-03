@@ -16,16 +16,17 @@
 | STRIPE_KEY                                | .stripe.key                                        | Stripe key                                                                     |
 | STRIPE_SECRET                             | .stripe.secret                                     | Stripe secret                                                                  |
 | SENTRY_DSN                                | .sentry.dsn                                        | Sentry DSN                                                                     |
+| SENTRY_TRACES_SAMPLE_RATE                 | .sentry.tracesSampleRate                           | Percentage of collected transactions to send to Sentry (for performances)      |
 | AWS_KEY                                   | .aws.s3.key                                        | AWS key                                                                        |
 | AWS_SECRET                                | .aws.s3.secret                                     | AWS secret                                                                     |
 | AWS_S3_BUCKET                             | .aws.s3.bucket                                     | AWS s3 bucket to send files                                                    |
 | CLOUDFLARE_KEY                            | .cloudflare.key                                    | CLOUDFLARE key                                                                 |
 | CLOUDFLARE_EMAIL                          | .cloudflare.email                                  | CLOUDFLARE email                                                               |
 | CLOUDFLARE_ZONE                           | .cloudflare.zone                                   | CLOUDFLARE zone                                                                |
-| PAYPAL_EMAIL                              | .paypal.classic.email                              | Paypal main email                                                              |
-| PAYPAL_APP_ID                             | .paypal.classic.appId                              | Paypal APP ID                                                                  |
-| PAYPAL_PASSWORD                           | .paypal.classic.password                           | Paypal password                                                                |
-| PAYPAL_SIGNATURE                          | .paypal.classic.signature                          | Paypal signature                                                               |
+| PAYPAL_USER_ID                            | .paypal.classic.userId                             | Paypal USER ID (legacy adaptive)                                               |
+| PAYPAL_APP_ID                             | .paypal.classic.appId                              | Paypal APP ID (legacy adaptive)                                                |
+| PAYPAL_PASSWORD                           | .paypal.classic.password                           | Paypal password (legacy adaptive)                                              |
+| PAYPAL_SIGNATURE                          | .paypal.classic.signature                          | Paypal signature (legacy adaptive)                                             |
 | MAILGUN_USER                              | .mailgun.user                                      | mailgun user                                                                   |
 | MAILGUN_API_KEY                           | .mailgun.apiKey                                    | mailgun password                                                               |
 | API_URL                                   | .host.api                                          | API exposed url                                                                |

@@ -10,6 +10,7 @@ import expenseStatus from '../../../constants/expense_status';
 import logger from '../../../lib/logger';
 import RateLimit from '../../../lib/rate-limit';
 import { reportErrorToSentry } from '../../../lib/sentry';
+import twoFactorAuthLib from '../../../lib/two-factor-authentication/lib';
 import models from '../../../models';
 import {
   approveExpense,
@@ -70,6 +71,9 @@ const expenseMutations = {
         payoutMethod.id = idDecode(payoutMethod.id, IDENTIFIER_TYPES.PAYOUT_METHOD);
       }
 
+      const fromCollective = await fetchAccountWithReference(args.expense.payee, { throwIfMissing: true });
+      await twoFactorAuthLib.enforceForAccountAdmins(req, fromCollective, { onlyAskOnLogin: true });
+
       // Right now this endpoint uses the old mutation by adapting the data for it. Once we get rid
       // of the `createExpense` endpoint in V1, the actual code to create the expense should be moved
       // here and cleaned.
@@ -89,7 +93,7 @@ const expenseMutations = {
         ]),
         payoutMethod,
         collective: await fetchAccountWithReference(args.account, req),
-        fromCollective: await fetchAccountWithReference(args.expense.payee, { throwIfMissing: true }),
+        fromCollective,
       });
 
       if (args.recurring) {
@@ -148,6 +152,7 @@ const expenseMutations = {
         attachedFiles: expense.attachedFiles?.map(attachedFile => ({
           id: attachedFile.id && idDecode(attachedFile.id, IDENTIFIER_TYPES.EXPENSE_ITEM),
           url: attachedFile.url,
+          name: attachedFile.name,
         })),
         fromCollective: payeeExists && (await fetchAccountWithReference(expense.payee, { throwIfMissing: true })),
       };
@@ -221,7 +226,7 @@ const expenseMutations = {
       const expenseId = getDatabaseIdFromExpenseReference(args.expense);
       const expense = await models.Expense.findByPk(expenseId, {
         // Need to load the collective because canDeleteExpense checks expense.collective.HostCollectiveId
-        include: [{ model: models.Collective, as: 'collective' }],
+        include: [{ model: models.Collective, as: 'collective', include: [{ association: 'host' }] }],
       });
 
       if (!expense) {
@@ -230,6 +235,13 @@ const expenseMutations = {
         throw new Unauthorized(
           "You don't have permission to delete this expense or it needs to be rejected before being deleted",
         );
+      }
+
+      // Check if 2FA is enforced on any of the account remote user is admin of
+      for (const account of [expense.collective, expense.collective.host].filter(Boolean)) {
+        if (await twoFactorAuthLib.enforceForAccountAdmins(req, account, { onlyAskOnLogin: true })) {
+          break;
+        }
       }
 
       // Cancel recurring expense
@@ -275,13 +287,9 @@ const expenseMutations = {
               type: GraphQLBoolean,
               description: 'Bypass automatic integrations (ie. PayPal, Transferwise) to process the expense manually',
             },
-            twoFactorAuthenticatorCode: {
-              type: GraphQLString,
-              description: '2FA code for if the host account has 2FA for payouts turned on.',
-            },
             feesPayer: {
               type: FeesPayer,
-              description: '2FA code for if the host account has 2FA for payouts turned on.',
+              description: 'Who is responsible for paying any due fees.',
               defaultValue: 'COLLECTIVE',
             },
           }),
@@ -292,6 +300,18 @@ const expenseMutations = {
       checkRemoteUserCanUseExpenses(req);
 
       const expense = await fetchExpenseWithReference(args.expense, { loaders: req.loaders, throwIfMissing: true });
+      const collective = await expense.getCollective();
+      const host = await collective.getHostCollective();
+
+      // Enforce 2FA for processing expenses, except for `PAY` action which handles it internally (with rolling limit)
+      if (!['PAY', 'SCHEDULE_FOR_PAYMENT'].includes(args.action)) {
+        for (const account of [collective, host].filter(Boolean)) {
+          if (await twoFactorAuthLib.enforceForAccountAdmins(req, account, { onlyAskOnLogin: true })) {
+            break;
+          }
+        }
+      }
+
       switch (args.action) {
         case 'APPROVE':
           return approveExpense(req, expense);
@@ -311,7 +331,6 @@ const expenseMutations = {
           );
         case 'SCHEDULE_FOR_PAYMENT':
           return scheduleExpenseForPayment(req, expense, {
-            twoFactorAuthenticatorCode: args.paymentParams?.twoFactorAuthenticatorCode,
             feesPayer: args.paymentParams?.feesPayer,
           });
         case 'UNSCHEDULE_PAYMENT':
@@ -321,7 +340,6 @@ const expenseMutations = {
             id: expense.id,
             paymentProcessorFeeInCollectiveCurrency: args.paymentParams?.paymentProcessorFee,
             forceManual: args.paymentParams?.forceManual,
-            twoFactorAuthenticatorCode: args.paymentParams?.twoFactorAuthenticatorCode,
             feesPayer: args.paymentParams?.feesPayer,
           });
         default:

@@ -7,6 +7,7 @@ import { TransactionTypes } from '../constants/transactions';
 import { toNegative } from '../lib/math';
 import { exportToCSV } from '../lib/utils';
 import models, { Op, sequelize } from '../models';
+import Tier from '../models/Tier';
 
 import { getFxRate } from './currency';
 
@@ -150,10 +151,10 @@ export async function createTransactionsFromPaidExpense(
   fees = { ...DEFAULT_FEES, ...fees };
   expense.collective = expense.collective || (await models.Collective.findByPk(expense.CollectiveId));
 
-  // Get the right FX rate for the expense
+  // Use the supplied FX rate or fetch a new one for the time of payment
   const expenseToHostFxRate =
     expenseToHostFxRateConfig === 'auto'
-      ? await getFxRate(expense.currency, host.currency, expense.incurredAt || expense.createdAt)
+      ? await getFxRate(expense.currency, host.currency, new Date())
       : expenseToHostFxRateConfig;
 
   const expenseDataForTransaction: Record<string, unknown> = { expenseToHostFxRate };
@@ -316,7 +317,8 @@ export async function generateDescription(transaction, { req = null, full = fals
     }
   }
 
-  let order, expense, subscription, tier;
+  let order, expense, subscription;
+  let tier: Tier;
 
   if (transaction.OrderId) {
     order = await (req ? req.loaders.Order.byId.load(transaction.OrderId) : models.Order.findByPk(transaction.OrderId));

@@ -2,6 +2,7 @@ import config from 'config';
 import { GraphQLNonNull } from 'graphql';
 import { pick } from 'lodash';
 
+import twoFactorAuthLib from '../../../lib/two-factor-authentication';
 import models from '../../../models';
 import { checkRemoteUserCanUseApplications } from '../../common/scope-check';
 import { Forbidden, NotFound, RateLimitExceeded } from '../../errors';
@@ -24,6 +25,9 @@ const createApplication = {
     const collective = args.application.account
       ? await fetchAccountWithReference(args.application.account, { throwIfMissing: true })
       : req.remoteUser.collective;
+
+    // Enforce 2FA
+    await twoFactorAuthLib.enforceForAccountAdmins(req, collective);
 
     if (!req.remoteUser.isAdminOfCollective(collective)) {
       throw new Forbidden();

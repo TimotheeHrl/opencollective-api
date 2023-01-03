@@ -1,11 +1,10 @@
 import { GraphQLBoolean, GraphQLInt, GraphQLInterfaceType, GraphQLList, GraphQLNonNull, GraphQLString } from 'graphql';
 import { GraphQLDateTime } from 'graphql-scalars';
 import { GraphQLJSON } from 'graphql-type-json';
-import { assign, get, invert, isEmpty, isNull, merge, omitBy, pick } from 'lodash';
+import { assign, get, invert, isEmpty, isNull, merge, omitBy } from 'lodash';
 
 import { types as CollectiveTypes } from '../../../constants/collectives';
 import FEATURE from '../../../constants/feature';
-import { PUBLIC_POLICIES } from '../../../constants/policies';
 import { buildSearchConditions } from '../../../lib/search';
 import { canSeeLegalName } from '../../../lib/user-permissions';
 import models, { Op } from '../../../models';
@@ -60,20 +59,20 @@ import { IsMemberOfFields } from './IsMemberOf';
 
 const accountFieldsDefinition = () => ({
   id: {
-    type: GraphQLString,
+    type: new GraphQLNonNull(GraphQLString),
     description: 'The public id identifying the account (ie: 5v08jk63-w4g9nbpz-j7qmyder-p7ozax5g)',
   },
   legacyId: {
-    type: GraphQLInt,
+    type: new GraphQLNonNull(GraphQLInt),
     description: 'The internal database identifier of the collective (ie: 580)',
     deprecationReason: '2020-01-01: should only be used during the transition to GraphQL API v2.',
   },
   slug: {
-    type: GraphQLString,
+    type: new GraphQLNonNull(GraphQLString),
     description: 'The slug identifying the account (ie: babel)',
   },
   type: {
-    type: AccountType,
+    type: new GraphQLNonNull(AccountType),
     description: 'The type of the account (BOT/COLLECTIVE/EVENT/ORGANIZATION/INDIVIDUAL/VENDOR)',
   },
   name: {
@@ -164,7 +163,7 @@ const accountFieldsDefinition = () => ({
     description: 'The time of last update',
   },
   isArchived: {
-    type: GraphQLBoolean,
+    type: new GraphQLNonNull(GraphQLBoolean),
     description: 'Returns whether this account is archived',
   },
   isFrozen: {
@@ -176,7 +175,7 @@ const accountFieldsDefinition = () => ({
     description: 'Returns whether the account accepts financial contributions.',
   },
   isHost: {
-    type: GraphQLBoolean,
+    type: new GraphQLNonNull(GraphQLBoolean),
     description: 'Returns whether the account is setup to Host collectives.',
   },
   isAdmin: {
@@ -185,6 +184,7 @@ const accountFieldsDefinition = () => ({
   },
   parentAccount: {
     type: Account,
+    deprecationReason: '2022-12-16: use parent on AccountWithParent instead',
     async resolve(collective, _, req) {
       if (!collective.ParentCollectiveId) {
         return null;
@@ -348,6 +348,11 @@ const accountFieldsDefinition = () => ({
           'Whether to include expired payment methods. Payment methods expired since more than 6 months will never be returned.',
       },
     },
+  },
+  paymentMethodsWithPendingConfirmation: {
+    type: new GraphQLList(PaymentMethod),
+    description:
+      'The list of payment methods for this account that are pending a client confirmation (3D Secure / SCA)',
   },
   connectedAccounts: {
     type: new GraphQLList(ConnectedAccount),
@@ -613,13 +618,8 @@ const accountFieldsDefinition = () => ({
     type: new GraphQLNonNull(Policies),
     description:
       'Policies for the account. To see non-public policies you need to be admin and have the scope: "account".',
-    async resolve(account, _, req) {
-      const policies = account.data?.policies || {};
-      if (req.remoteUser?.isAdminOfCollective(account) && checkScope(req, 'account')) {
-        return policies;
-      }
-
-      return pick(policies, PUBLIC_POLICIES);
+    async resolve(account) {
+      return account;
     },
   },
   activitySubscriptions: {
@@ -689,19 +689,19 @@ const accountWebhooks = {
 export const AccountFields = {
   ...accountFieldsDefinition(),
   id: {
-    type: GraphQLString,
+    type: new GraphQLNonNull(GraphQLString),
     resolve(collective) {
       return idEncode(collective.id, 'account');
     },
   },
   legacyId: {
-    type: GraphQLInt,
+    type: new GraphQLNonNull(GraphQLInt),
     resolve(collective) {
       return collective.id;
     },
   },
   type: {
-    type: AccountType,
+    type: new GraphQLNonNull(AccountType),
     resolve(collective) {
       return invert(AccountTypeToModelMapping)[collective.type];
     },
@@ -737,7 +737,7 @@ export const AccountFields = {
     },
   },
   isArchived: {
-    type: GraphQLBoolean,
+    type: new GraphQLNonNull(GraphQLBoolean),
     description: 'Returns whether this account is archived',
     resolve(collective) {
       return Boolean(collective.deactivatedAt);
@@ -751,7 +751,7 @@ export const AccountFields = {
     },
   },
   isHost: {
-    type: GraphQLBoolean,
+    type: new GraphQLNonNull(GraphQLBoolean),
     description: 'Returns whether the account is setup to Host collectives.',
     resolve(collective) {
       return Boolean(collective.isHostAccount);
@@ -875,7 +875,7 @@ export const AccountFields = {
     description:
       'The list of payment methods that this collective can use to pay for Orders. Admin only. Scope: "orders".',
     async resolve(collective, args, req) {
-      if (!req.remoteUser?.isAdminOfCollective(collective) || !checkScope(req, 'paymentMethods')) {
+      if (!req.remoteUser?.isAdminOfCollective(collective) || !checkScope(req, 'orders')) {
         return null;
       }
 
@@ -901,6 +901,35 @@ export const AccountFields = {
         } else {
           return true;
         }
+      });
+    },
+  },
+  paymentMethodsWithPendingConfirmation: {
+    type: new GraphQLList(PaymentMethod),
+    description:
+      'The list of payment methods for this account that are pending a client confirmation (3D Secure / SCA)',
+    async resolve(collective, _, req) {
+      if (!req.remoteUser?.isAdminOfCollective(collective)) {
+        return null;
+      }
+
+      return models.PaymentMethod.findAll({
+        where: { CollectiveId: collective.id },
+        group: ['PaymentMethod.id'],
+        include: [
+          {
+            model: models.Order,
+            required: true,
+            attributes: [],
+            include: [{ model: models.Subscription, required: true, attributes: [], where: { isActive: true } }],
+            where: {
+              data: { needsConfirmation: true },
+              status: {
+                [Op.in]: ['REQUIRE_CLIENT_CONFIRMATION', 'ERROR', 'PENDING'],
+              },
+            },
+          },
+        ],
       });
     },
   },

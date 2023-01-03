@@ -3,6 +3,7 @@ import { pick } from 'lodash';
 import moment from 'moment';
 
 import { PAYMENT_METHOD_SERVICE, PAYMENT_METHOD_TYPE } from '../../../constants/paymentMethods';
+import stripe from '../../../lib/stripe';
 import { PaymentMethodLegacyType } from '../enum';
 import { getServiceTypeFromLegacyPaymentMethodType } from '../enum/PaymentMethodLegacyType';
 import { PaymentMethodService } from '../enum/PaymentMethodService';
@@ -57,6 +58,10 @@ export const PaymentMethodInput = new GraphQLInputObjectType({
       type: PaypalPaymentInput,
       description: 'To pass when type is PAYPAL',
     },
+    paymentIntentId: {
+      type: GraphQLString,
+      description: 'The Payment Intent ID used in this checkout',
+    },
   }),
 });
 
@@ -74,32 +79,30 @@ export const getLegacyPaymentMethodFromPaymentMethodInput = async (
   }
 
   if (pm.creditCardInfo) {
+    const token = await stripe.tokens.retrieve(pm.creditCardInfo.token);
     const paymentMethod = {
       service: PAYMENT_METHOD_SERVICE.STRIPE,
       type: PAYMENT_METHOD_TYPE.CREDITCARD,
-      name: pm.name,
+      name: token.card.last4,
       save: pm.isSavedForLater,
       token: pm.creditCardInfo.token,
-      data: pick(pm.creditCardInfo, [
-        'brand',
-        'country',
-        'expMonth',
-        'expYear',
-        'fullName',
-        'funding',
-        'zip',
-        'fingerprint',
-      ]),
+      data: {
+        ...pick(pm.creditCardInfo, ['zip']), // Not returned by Stripe
+        ...pick(token.card, ['brand', 'country', 'funding', 'fingerprint', 'last4']), // Returned by Stripe
+        name: token.card.name,
+        expMonth: token.card.exp_month,
+        expYear: token.card.exp_year,
+      },
     };
-    if (pm.creditCardInfo.expYear && pm.creditCardInfo.expMonth) {
-      const { expYear, expMonth } = pm.creditCardInfo;
+    if (paymentMethod.data.expYear && paymentMethod.data.expMonth) {
+      const { expYear, expMonth } = paymentMethod.data;
       paymentMethod['expiryDate'] = moment.utc(`${expYear}-${expMonth}`, 'YYYY-MM').endOf('month');
     }
     // Internal fallback for card fingerprint
     if (!paymentMethod.data?.fingerprint) {
       paymentMethod.data.fingerprint = [
-        pm.name,
-        ...Object.values(pick(pm.creditCardInfo, ['brand', 'expMonth', 'expYear', 'funding'])),
+        paymentMethod.name,
+        ...Object.values(pick(paymentMethod.data, ['brand', 'expMonth', 'expYear', 'funding'])),
       ].join('-');
     }
     return paymentMethod;
@@ -121,6 +124,8 @@ export const getLegacyPaymentMethodFromPaymentMethodInput = async (
         },
       };
     }
+  } else if (pm.paymentIntentId) {
+    return { service: pm.service, type: pm.newType, paymentIntentId: pm.paymentIntentId, save: pm.isSavedForLater };
   } else if (pm.legacyType) {
     return getServiceTypeFromLegacyPaymentMethodType(pm.legacyType);
   } else if (pm.service && pm.newType) {

@@ -7,6 +7,8 @@ import { createSandbox, useFakeTimers } from 'sinon';
 import { roles } from '../../../../../server/constants';
 import { idEncode, IDENTIFIER_TYPES } from '../../../../../server/graphql/v2/identifiers';
 import * as payments from '../../../../../server/lib/payments';
+import stripe from '../../../../../server/lib/stripe';
+import { TwoFactorAuthenticationHeader } from '../../../../../server/lib/two-factor-authentication/lib';
 import models from '../../../../../server/models';
 import { randEmail } from '../../../../stores';
 import {
@@ -18,7 +20,7 @@ import {
   fakeTier,
   fakeUser,
 } from '../../../../test-helpers/fake-data';
-import { graphqlQueryV2, resetTestDB } from '../../../../utils';
+import { generateValid2FAHeader, graphqlQueryV2, resetTestDB } from '../../../../utils';
 
 const CREATE_ORDER_MUTATION = gqlV2/* GraphQL */ `
   mutation CreateOrder($order: OrderCreateInput!) {
@@ -190,6 +192,17 @@ describe('server/graphql/v2/mutation/OrderMutations', () => {
 
       // Stub the payment
       sandbox = createSandbox();
+      sandbox.stub(stripe.tokens, 'retrieve').callsFake(() =>
+        Promise.resolve({
+          id: 'tok_123456781234567812345678',
+          card: {
+            brand: 'VISA',
+            country: 'US',
+            expMonth: 11,
+            expYear: 2024,
+          },
+        }),
+      );
       sandbox.stub(payments, 'executeOrder').callsFake(stubExecuteOrderFn);
 
       // Add Stripe to host
@@ -515,6 +528,8 @@ describe('server/graphql/v2/mutation/OrderMutations', () => {
           makeIncognito,
         },
         loggedInUser,
+        undefined,
+        loggedInUser && { [TwoFactorAuthenticationHeader]: generateValid2FAHeader(loggedInUser) },
       );
     };
 
@@ -523,7 +538,7 @@ describe('server/graphql/v2/mutation/OrderMutations', () => {
     beforeEach(async () => {
       await resetTestDB();
       const rootOrg = await fakeOrganization({ id: 8686, slug: 'opencollective' });
-      rootUser = await fakeUser({}, { name: 'Root user' });
+      rootUser = await fakeUser({ data: { isRoot: true } }, { name: 'Root user' }, { enable2FA: true });
       await rootOrg.addUserWithRole(rootUser, 'ADMIN');
     });
 

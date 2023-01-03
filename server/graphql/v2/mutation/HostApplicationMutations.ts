@@ -10,9 +10,13 @@ import POLICIES from '../../../constants/policies';
 import MemberRoles from '../../../constants/roles';
 import { purgeAllCachesForAccount, purgeCacheForCollective } from '../../../lib/cache';
 import emailLib from '../../../lib/email';
-import { getPolicy } from '../../../lib/policies';
+import * as github from '../../../lib/github';
+import { OSCValidator, ValidatedRepositoryInfo } from '../../../lib/osc-validator';
+import { getPolicy, hasPolicy } from '../../../lib/policies';
 import { stripHTML } from '../../../lib/sanitize-html';
+import twoFactorAuthLib from '../../../lib/two-factor-authentication';
 import models, { sequelize } from '../../../models';
+import ConversationModel from '../../../models/Conversation';
 import { HostApplicationStatus } from '../../../models/HostApplication';
 import { processInviteMembersInput } from '../../common/members';
 import { checkRemoteUserCanUseAccount, checkRemoteUserCanUseHost, checkScope } from '../../common/scope-check';
@@ -77,10 +81,14 @@ const HostApplicationMutations = {
         throw new Forbidden('You need to be an Admin of the account');
       }
 
+      await twoFactorAuthLib.enforceForAccountAdmins(req, collective);
+
       const host = await fetchAccountWithReference(args.host);
       if (!host) {
         throw new NotFound('Host not found');
       }
+
+      const isProd = config.env === 'production';
 
       const where = {
         CollectiveId: collective.id,
@@ -96,16 +104,49 @@ const HostApplicationMutations = {
         throw new Forbidden(`This host policy requires at least ${requiredAdmins} admins for this account.`);
       }
 
-      const { githubHandle } = args.applicationData || {};
-      if (githubHandle) {
-        collective.repositoryUrl = `https://github.com/${githubHandle}`;
+      let validatedRepositoryInfo: ValidatedRepositoryInfo,
+        shouldAutomaticallyApprove = false;
+
+      // Trigger automated Github approval when repository is on github.com
+      const repositoryUrl = args.applicationData?.repositoryUrl;
+      const { hostname } = repositoryUrl ? new URL(repositoryUrl) : { hostname: '' };
+      if (hostname === 'github.com') {
+        const githubHandle = github.getGithubHandleFromUrl(repositoryUrl);
+        try {
+          // For e2e testing, we enable testuser+(admin|member|host)@opencollective.com to create collective without github validation
+          const bypassGithubValidation = !isProd && req.remoteUser.email.match(/.*test.*@opencollective.com$/);
+          if (!bypassGithubValidation) {
+            const githubAccount = await models.ConnectedAccount.findOne({
+              where: { CollectiveId: req.remoteUser.CollectiveId, service: 'github' },
+            });
+            if (githubAccount) {
+              // In e2e/CI environment, checkGithubAdmin will be stubbed
+              await github.checkGithubAdmin(githubHandle, githubAccount.token);
+
+              if (githubHandle.includes('/')) {
+                validatedRepositoryInfo = OSCValidator(
+                  await github.getValidatorInfo(githubHandle, githubAccount.token),
+                );
+              }
+            }
+          }
+          const { allValidationsPassed } = validatedRepositoryInfo || {};
+          shouldAutomaticallyApprove = Boolean(allValidationsPassed || bypassGithubValidation);
+        } catch (error) {
+          throw new ValidationFailed(error.message);
+        }
+      }
+
+      if (repositoryUrl) {
+        collective.repositoryUrl = repositoryUrl;
         await collective.save();
       }
 
       // No need to check the balance, this is being handled in changeHost, along with most other checks
       const response = await collective.changeHost(host.id, req.remoteUser, {
+        shouldAutomaticallyApprove,
         message: args.message,
-        applicationData: args.applicationData,
+        applicationData: { ...args.applicationData, validatedRepositoryInfo },
       });
 
       if (args.inviteMembers && args.inviteMembers.length) {
@@ -153,6 +194,9 @@ const HostApplicationMutations = {
         throw new ValidationFailed('This collective application has already been approved');
       }
 
+      // Enforce 2FA
+      await twoFactorAuthLib.enforceForAccountAdmins(req, host, { onlyAskOnLogin: true });
+
       switch (args.action) {
         case 'APPROVE':
           return { account: await approveApplication(host, account, req) };
@@ -191,12 +235,16 @@ const HostApplicationMutations = {
         throw new ValidationFailed(`Cannot unhost projects/events with a parent. Please unhost the parent instead.`);
       }
 
-      const host = await req.loaders.Collective.host.load(account.id);
+      const host = await req.loaders.Collective.host.load(account);
       if (!host) {
         return account;
       }
       if (!req.remoteUser.isAdminOfCollective(host) && !(req.remoteUser.isRoot() && checkScope(req, 'root'))) {
         throw new Unauthorized();
+      }
+
+      if (hasPolicy(host, POLICIES.REQUIRE_2FA_FOR_ADMINS)) {
+        await twoFactorAuthLib.validateRequest(req, { alwaysAskForToken: true, requireTwoFactorAuthEnabled: true });
       }
 
       await account.changeHost(null);
@@ -258,7 +306,7 @@ const approveApplication = async (host, collective, req) => {
     type: activities.COLLECTIVE_APPROVED,
     UserId: req.remoteUser?.id,
     UserTokenId: req.userToken?.id,
-    CollectiveId: host.id, // TODO(InconsistentActivities): Should be collective.id
+    CollectiveId: collective.id,
     HostCollectiveId: host.id,
     data: {
       collective: collective.info,
@@ -296,7 +344,7 @@ const rejectApplication = async (host, collective, req, reason: string) => {
     type: activities.COLLECTIVE_REJECTED,
     UserId: remoteUser.id,
     UserTokenId: req.userToken?.id,
-    CollectiveId: host.id, // TODO(InconsistentActivities): Should be CollectiveId
+    CollectiveId: collective.id,
     HostCollectiveId: host.id,
     data: {
       collective: collective.info,
@@ -326,11 +374,12 @@ const sendPrivateMessage = async (host, collective, message: string): Promise<vo
     },
     {
       bcc: adminUsers.map(u => u.email),
+      replyTo: host.data?.replyToEmail || undefined,
     },
   );
 };
 
-const sendPublicMessage = async (host, collective, user, message: string): Promise<typeof models.Conversation> => {
+const sendPublicMessage = async (host, collective, user, message: string): Promise<ConversationModel> => {
   const title = `About your application to ${host.name}`;
   const tags = ['host'];
   return models.Conversation.createWithComment(user, collective, title, message, tags);

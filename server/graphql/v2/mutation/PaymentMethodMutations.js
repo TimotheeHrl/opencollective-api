@@ -1,6 +1,8 @@
 import { GraphQLBoolean, GraphQLNonNull, GraphQLObjectType, GraphQLString } from 'graphql';
 import { omit, pick } from 'lodash';
 
+import stripe from '../../../lib/stripe';
+import twoFactorAuthLib from '../../../lib/two-factor-authentication';
 import models from '../../../models';
 import { setupCreditCard } from '../../../paymentProviders/stripe/creditcard';
 import { checkRemoteUserCanUseOrders } from '../../common/scope-check';
@@ -55,6 +57,10 @@ const addCreditCard = {
       throw new Forbidden(`Must be an admin of ${collective.name}`);
     }
 
+    // Check 2FA
+    await twoFactorAuthLib.enforceForAccountAdmins(req, collective, { onlyAskOnLogin: true });
+
+    const token = await stripe.tokens.retrieve(args.creditCardInfo.token);
     const newPaymentMethodData = {
       service: 'stripe',
       type: 'creditcard',
@@ -64,7 +70,12 @@ const addCreditCard = {
       saved: args.isSavedForLater,
       CollectiveId: collective.id,
       token: args.creditCardInfo.token,
-      data: pick(args.creditCardInfo, ['brand', 'country', 'expMonth', 'expYear', 'fullName', 'funding', 'zip']),
+      data: {
+        ...pick(token.card, ['brand', 'country', 'fullName', 'funding', 'zip', 'fingerprint']),
+        name: token.card.name,
+        expMonth: token.card.exp_month,
+        expYear: token.card.exp_year,
+      },
     };
 
     let pm = await models.PaymentMethod.create(newPaymentMethodData);

@@ -9,6 +9,7 @@ import {
   GraphQLObjectType,
   GraphQLString,
 } from 'graphql';
+import { GraphQLNonEmptyString } from 'graphql-scalars';
 import { GraphQLJSON } from 'graphql-type-json';
 import { cloneDeep, isNull, omitBy, set } from 'lodash';
 
@@ -16,8 +17,10 @@ import activities from '../../../constants/activities';
 import { types as COLLECTIVE_TYPE } from '../../../constants/collectives';
 import * as collectivelib from '../../../lib/collectivelib';
 import { crypto } from '../../../lib/encryption';
-import { verifyTwoFactorAuthenticatorCode } from '../../../lib/two-factor-authentication';
+import TwoFactorAuthLib from '../../../lib/two-factor-authentication';
+import { validateTOTPToken } from '../../../lib/two-factor-authentication/totp';
 import models, { sequelize } from '../../../models';
+import { sendMessage } from '../../common/collective';
 import { checkRemoteUserCanUseAccount, checkRemoteUserCanUseHost } from '../../common/scope-check';
 import { Forbidden, NotFound, Unauthorized, ValidationFailed } from '../../errors';
 import { AccountTypeToModelMapping } from '../enum/AccountType';
@@ -86,6 +89,11 @@ const accountMutations = {
           checkRemoteUserCanUseHost(req);
         } else {
           checkRemoteUserCanUseAccount(req);
+        }
+
+        // Enforce 2FA if trying to change 2FA rolling limit settings while it's already enabled
+        if (args.key.split('.')[0] === 'payoutsTwoFactorAuth' && account.settings?.payoutsTwoFactorAuth?.enabled) {
+          await TwoFactorAuthLib.validateRequest(req, { alwaysAskForToken: true, requireTwoFactorAuthEnabled: true });
         }
 
         if (
@@ -344,7 +352,7 @@ const accountMutations = {
         throw new Unauthorized('This account already has 2FA disabled.');
       }
 
-      const verified = verifyTwoFactorAuthenticatorCode(user.twoFactorAuthToken, args.code);
+      const verified = validateTOTPToken(user.twoFactorAuthToken, args.code);
 
       if (!verified) {
         throw new Unauthorized('Two-factor authentication code failed. Please try again');
@@ -383,6 +391,8 @@ const accountMutations = {
       if (!req.remoteUser.isAdminOfCollective(account) && !req.remoteUser.isRoot()) {
         throw new Forbidden();
       }
+
+      await TwoFactorAuthLib.enforceForAccountAdmins(req, account, { onlyAskOnLogin: true });
 
       for (const key of Object.keys(args.account)) {
         switch (key) {
@@ -432,8 +442,15 @@ const accountMutations = {
         throw new Unauthorized();
       }
 
+      // Merge submitted policies with existing ones
       const previousPolicies = account.data?.policies;
       const newPolicies = omitBy({ ...previousPolicies, ...args.policies }, isNull);
+
+      // Enforce 2FA when trying to disable `REQUIRE_2FA_FOR_ADMINS`
+      if (previousPolicies?.REQUIRE_2FA_FOR_ADMINS && !newPolicies.REQUIRE_2FA_FOR_ADMINS) {
+        await TwoFactorAuthLib.validateRequest(req, { alwaysAskForToken: true, requireTwoFactorAuthEnabled: true });
+      }
+
       await account.setPolicies(newPolicies);
       await models.Activity.create({
         type: activities.COLLECTIVE_EDITED,
@@ -470,6 +487,8 @@ const accountMutations = {
         throw new Unauthorized('You need to be logged in as an Admin of the account.');
       }
 
+      await TwoFactorAuthLib.enforceForAccountAdmins(req, account, { alwaysAskForToken: true });
+
       if (await account.isHost()) {
         throw new Error(
           `You can't delete an account activated as Host. Please, desactivate the account as Host and try again.`,
@@ -483,6 +502,31 @@ const accountMutations = {
       }
 
       return collectivelib.deleteCollective(account);
+    },
+  },
+  sendMessage: {
+    type: new GraphQLObjectType({
+      name: 'SendMessageResult',
+      fields: {
+        success: { type: GraphQLBoolean },
+      },
+    }),
+    description: 'Send a message to an account. Scope: "account"',
+    args: {
+      account: {
+        type: new GraphQLNonNull(AccountReferenceInput),
+        description: 'Reference to the Account to send message to.',
+      },
+      message: {
+        type: new GraphQLNonNull(GraphQLNonEmptyString),
+        description: 'Message to send to the account.',
+      },
+      subject: { type: GraphQLString },
+    },
+    async resolve(_, args, req) {
+      const account = await fetchAccountWithReference(args.account, { throwIfMissing: true });
+
+      return sendMessage({ req, args, collective: account, isGqlV2: true });
     },
   },
 };

@@ -12,6 +12,7 @@ import { payExpense } from '../../../../../server/graphql/common/expenses';
 import { idEncode, IDENTIFIER_TYPES } from '../../../../../server/graphql/v2/identifiers';
 import { getFxRate } from '../../../../../server/lib/currency';
 import emailLib from '../../../../../server/lib/email';
+import { TwoFactorAuthenticationHeader } from '../../../../../server/lib/two-factor-authentication/lib';
 import models from '../../../../../server/models';
 import { PayoutMethodTypes } from '../../../../../server/models/PayoutMethod';
 import paymentProviders from '../../../../../server/paymentProviders';
@@ -1431,7 +1432,8 @@ describe('server/graphql/v2/mutation/ExpenseMutations', () => {
 
         // Check individual transactions
         await Promise.all(allTransactions.map(t => t.validate()));
-        const getTransaction = type => models.Transaction.findOne({ where: { type, ExpenseId: expense.id } });
+        const getTransaction = type =>
+          models.Transaction.findOne({ where: { type, ExpenseId: expense.id }, order: [['id', 'ASC']] });
 
         const debitTransaction = await getTransaction('DEBIT');
         const expectedFee = Math.round(paymentProcessorFee * debitTransaction.hostCurrencyFxRate);
@@ -1511,7 +1513,8 @@ describe('server/graphql/v2/mutation/ExpenseMutations', () => {
 
         // Check transactions
         await Promise.all(allTransactions.map(t => t.validate()));
-        const getTransaction = type => models.Transaction.findOne({ where: { type, ExpenseId: expense.id } });
+        const getTransaction = type =>
+          models.Transaction.findOne({ where: { type, ExpenseId: expense.id }, order: [['id', 'ASC']] });
 
         const debitTransaction = await getTransaction('DEBIT');
         const expectedFee = Math.round(paymentProcessorFee * debitTransaction.hostCurrencyFxRate);
@@ -1934,7 +1937,10 @@ describe('server/graphql/v2/mutation/ExpenseMutations', () => {
       await fakeTransaction({ type: 'CREDIT', CollectiveId: testCollective.id, amount: expense.amount });
       await payExpense(makeRequest(hostAdmin), { id: expense.id });
 
-      const newTransactions = await models.Transaction.findAll({ where: { ExpenseId: expense.id } });
+      const newTransactions = await models.Transaction.findAll({
+        where: { ExpenseId: expense.id },
+        order: [['id', 'ASC']],
+      });
       expect(newTransactions.slice(-2).every(tx => tx.PayoutMethodId === newPayoutMethod.id)).to.equal(true);
     });
   });
@@ -2077,9 +2083,10 @@ describe('server/graphql/v2/mutation/ExpenseMutations', () => {
       const expenseMutationParams1 = {
         expenseId: expense1.id,
         action: 'PAY',
-        paymentParams: { twoFactorAuthenticatorCode },
       };
-      const result1 = await graphqlQueryV2(processExpenseMutation, expenseMutationParams1, hostAdmin);
+      const result1 = await graphqlQueryV2(processExpenseMutation, expenseMutationParams1, hostAdmin, null, {
+        [TwoFactorAuthenticationHeader]: `totp ${twoFactorAuthenticatorCode}`,
+      });
 
       expect(result1.errors).to.not.exist;
       expect(result1.data.processExpense.status).to.eq('PROCESSING');
@@ -2112,9 +2119,8 @@ describe('server/graphql/v2/mutation/ExpenseMutations', () => {
       const result4 = await graphqlQueryV2(processExpenseMutation, expenseMutationParams4, hostAdmin);
 
       expect(result4.errors).to.exist;
-      expect(result4.errors[0].message).to.eq(
-        'Two-factor authentication payout limit exceeded: please re-enter your code.',
-      );
+      expect(result4.errors[0].message).to.eq('Two-factor authentication required');
+      expect(result4.errors[0].extensions.code).to.eq('2FA_REQUIRED');
     });
 
     it('authorizes users based on their active session', async () => {
@@ -2152,7 +2158,8 @@ describe('server/graphql/v2/mutation/ExpenseMutations', () => {
         },
       );
       expect(result1.errors).to.exist;
-      expect(result1.errors[0].message).to.eq('Two-factor authentication enabled: please enter your code.');
+      expect(result1.errors[0].message).to.eq('Two-factor authentication required');
+      expect(result1.errors[0].extensions.code).to.eq('2FA_REQUIRED');
 
       // It works with session 1
       const result2 = await graphqlQueryV2(
@@ -2160,9 +2167,12 @@ describe('server/graphql/v2/mutation/ExpenseMutations', () => {
         {
           expenseId: expense1.id,
           action: 'PAY',
-          paymentParams: { twoFactorAuthenticatorCode },
         },
         hostAdmin,
+        null,
+        {
+          [TwoFactorAuthenticationHeader]: `totp ${twoFactorAuthenticatorCode}`,
+        },
       );
       expect(result2.errors).to.not.exist;
       expect(result2.data.processExpense.status).to.eq('PROCESSING');
@@ -2180,7 +2190,8 @@ describe('server/graphql/v2/mutation/ExpenseMutations', () => {
         },
       );
       expect(result3.errors).to.exist;
-      expect(result3.errors[0].message).to.eq('Two-factor authentication enabled: please enter your code.');
+      expect(result3.errors[0].message).to.eq('Two-factor authentication required');
+      expect(result3.errors[0].extensions.code).to.eq('2FA_REQUIRED');
     });
   });
 
